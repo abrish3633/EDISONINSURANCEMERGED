@@ -61,7 +61,7 @@ POLLING_INTERVAL = 3  # Polling interval after WS failure
 # ==================== INSURANCE / HEDGE MODE CONFIGURATION ====================
 INSURANCE_ENABLED = True            # Master switch for insurance leg
 INSURANCE_DELAY_MS = 400            # Delay before opening insurance leg (ms)
-SAFETY_FACTOR = Decimal("0.5")      # 50% safety factor (as requested)
+SAFETY_FACTOR = Decimal("1")      # 50% safety factor (as requested)
 
 # Virtual split configuration (emulating two separate accounts)
 MAIN_VIRTUAL_CAPITAL = Decimal("250")      # $250 virtual capital for MAIN
@@ -2403,7 +2403,7 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 # Cap by available margin
                 max_qty_by_margin = (main_margin_available * MAX_LEVERAGE) / entry_price
                 qty_main = min(qty_raw, max_qty_by_margin)
-                qty_main = qty_main * SAFETY_FACTOR  # 50% safety factor as requested
+                # qty_main = qty_main * SAFETY_FACTOR  # 50% safety factor as requested
                 qty_main = min(qty_main, Decimal("25"))
                 qty_main = quantize_qty(qty_main, step_size)
                 
@@ -2522,7 +2522,7 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                         qty_insurance = max_qty_by_margin_ins
                     
                     # Apply safety factor (same as MAIN)
-                    qty_insurance = qty_insurance * SAFETY_FACTOR
+                    # qty_insurance = qty_insurance * SAFETY_FACTOR
                     qty_insurance = min(qty_insurance, Decimal("25"))
                     qty_insurance = quantize_qty(qty_insurance, step_size)
                     
