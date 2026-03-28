@@ -47,7 +47,7 @@ BUY_RSI_MIN = Decimal("55")
 BUY_RSI_MAX = Decimal("65")
 SELL_RSI_MIN = Decimal("35")
 SELL_RSI_MAX = Decimal("45")
-POSITION_CHECK_INTERVAL = 60
+POSITION_CHECK_INTERVAL = 30
 TRAIL_PRICE_BUFFER = Decimal("0.003")
 KLINES_CACHE_DURATION = Decimal("5.0")
 REQUEST_TIMEOUT = 30
@@ -60,8 +60,8 @@ POLLING_INTERVAL = 3  # Polling interval after WS failure
 
 # ==================== INSURANCE / HEDGE MODE CONFIGURATION ====================
 INSURANCE_ENABLED = True            # Master switch for insurance leg
-INSURANCE_DELAY_MS = 400            # Delay before opening insurance leg (ms)
-SAFETY_FACTOR = Decimal("1")      # 50% safety factor (as requested)
+INSURANCE_DELAY_MS = 600            # Delay before opening insurance leg (ms)
+SAFETY_FACTOR = Decimal("0.90")      # 50% safety factor (as requested)
 
 # Virtual split configuration (emulating two separate accounts)
 MAIN_VIRTUAL_CAPITAL = Decimal("250")      # $250 virtual capital for MAIN
@@ -1179,10 +1179,11 @@ class BinanceClient:
             "side": side,
             "type": order_type,
             "quantity": str(quantity),
-            "reduceOnly": "true" if reduce_only else "false",
             "timeInForce": "GTE_GTC",
             "priceProtect": "true"
         }
+        if reduce_only:
+            params["reduceOnly"] = "true"
         if position_side:
             params["positionSide"] = position_side
         
@@ -2544,19 +2545,42 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                             "positionSide": insurance_position_side
                         })
                         
-                        # Wait for insurance fill
+                        # Wait for insurance fill with better detection
                         start_time_ins = time.time()
                         actual_qty_insurance = None
                         pos_amt_before = get_position_amt_for_side(client, symbol, insurance_position_side)
-                        while not bot_state.STOP_REQUESTED:
+                        
+                        # Try up to 60 seconds
+                        while not bot_state.STOP_REQUESTED and (time.time() - start_time_ins) < 60:
                             pos_amt = get_position_amt_for_side(client, symbol, insurance_position_side)
                             if pos_amt - pos_amt_before > Decimal('0.001'):
                                 actual_qty_insurance = pos_amt - pos_amt_before
+                                log(f"✅ Insurance fill detected! Qty: {actual_qty_insurance:.5f} SOL", 
+                                    telegram_bot, telegram_chat_id)
                                 break
-                            if time.time() - start_time_ins > ORDER_FILL_TIMEOUT:
-                                log("Insurance order fill timeout. Continuing with main only.", telegram_bot, telegram_chat_id)
-                                break
-                            time.sleep(0.5)
+                            time.sleep(1)  # Check every second
+                        
+                        if actual_qty_insurance is None:
+                            # Check order status directly as fallback
+                            try:
+                                order_status = client.send_signed_request("GET", "/fapi/v1/order", {
+                                    "symbol": symbol,
+                                    "orderId": order_res_insurance.get("orderId")
+                                })
+                                if order_status.get("status") == "FILLED":
+                                    actual_qty_insurance = Decimal(str(order_status.get("executedQty", "0")))
+                                    log(f"✅ Insurance fill detected via order status! Qty: {actual_qty_insurance:.5f} SOL",
+                                        telegram_bot, telegram_chat_id)
+                            except Exception as e:
+                                log(f"Order status check failed: {e}", telegram_bot, telegram_chat_id)
+                        
+                        if actual_qty_insurance is None or actual_qty_insurance <= Decimal('0'):
+                            log("❌ Insurance leg fill failed. Continuing with main leg only.", telegram_bot, telegram_chat_id)
+                        else:
+                            # Update insurance trade state with actual filled quantity
+                            insurance_trade_state.qty = actual_qty_insurance
+                            log("🛡️ Placing insurance protective orders...", telegram_bot, telegram_chat_id)
+                            place_orders(client, symbol, insurance_trade_state, tick_size, telegram_bot, telegram_chat_id)
                         
                         if actual_qty_insurance and actual_qty_insurance > Decimal('0'):
                             # Create insurance trade state
