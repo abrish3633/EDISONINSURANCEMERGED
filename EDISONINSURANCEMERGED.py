@@ -42,7 +42,7 @@ VOL_SMA_PERIOD = 16
 RSI_PERIOD = 14
 MAX_TRADES_PER_DAY = 1
 INTERVAL_DEFAULT = "45m"
-ORDER_FILL_TIMEOUT = 30
+ORDER_FILL_TIMEOUT = 60
 BUY_RSI_MIN = Decimal("55")
 BUY_RSI_MAX = Decimal("65")
 SELL_RSI_MIN = Decimal("35")
@@ -60,7 +60,7 @@ POLLING_INTERVAL = 3  # Polling interval after WS failure
 
 # ==================== INSURANCE / HEDGE MODE CONFIGURATION ====================
 INSURANCE_ENABLED = True            # Master switch for insurance leg
-INSURANCE_DELAY_MS = 600            # Delay before opening insurance leg (ms)
+INSURANCE_DELAY_MS = 400            # Delay before opening insurance leg (ms)
 SAFETY_FACTOR = Decimal("0.90")      # 50% safety factor (as requested)
 
 # Virtual split configuration (emulating two separate accounts)
@@ -2427,20 +2427,36 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 })
                 
                 # Wait for main fill
+                                # Wait for main fill with better detection
                 start_time = time.time()
                 actual_qty_main = None
-                while not bot_state.STOP_REQUESTED:
+                
+                # Try up to 60 seconds (ORDER_FILL_TIMEOUT should be 60)
+                while not bot_state.STOP_REQUESTED and (time.time() - start_time) < ORDER_FILL_TIMEOUT:
                     pos_amt = get_position_amt_for_side(client, symbol, main_position_side)
                     if pos_amt > Decimal('0.001'):
                         actual_qty_main = pos_amt
+                        log(f"✅ Main fill detected! Qty: {actual_qty_main:.5f} SOL", 
+                            telegram_bot, telegram_chat_id)
                         break
-                    if time.time() - start_time > ORDER_FILL_TIMEOUT:
-                        log("Main order fill timeout. Aborting.", telegram_bot, telegram_chat_id)
-                        pending_entry = False
-                        break
-                    time.sleep(0.5)
+                    time.sleep(1)  # Check every second (was 0.5)
                 
+                # If position detection failed, check order status directly
                 if actual_qty_main is None:
+                    try:
+                        order_status = client.send_signed_request("GET", "/fapi/v1/order", {
+                            "symbol": symbol,
+                            "orderId": order_res_main.get("orderId")
+                        })
+                        if order_status.get("status") == "FILLED":
+                            actual_qty_main = Decimal(str(order_status.get("executedQty", "0")))
+                            log(f"✅ Main fill detected via order status! Qty: {actual_qty_main:.5f} SOL",
+                                telegram_bot, telegram_chat_id)
+                    except Exception as e:
+                        log(f"Order status check failed: {e}", telegram_bot, telegram_chat_id)
+                
+                if actual_qty_main is None or actual_qty_main <= Decimal('0'):
+                    log("❌ Main leg fill failed. Aborting trade.", telegram_bot, telegram_chat_id)
                     pending_entry = False
                     continue
                 
@@ -2545,6 +2561,11 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                             "positionSide": insurance_position_side
                         })
                         
+                        # CREATE insurance_trade_state ONCE before fill detection
+                        insurance_trade_state = TradeState()
+                        insurance_trade_state.leg_type = "INSURANCE"
+                        insurance_trade_state.side = "LONG" if insurance_side == "BUY" else "SHORT"
+                        
                         # Wait for insurance fill with better detection
                         start_time_ins = time.time()
                         actual_qty_insurance = None
@@ -2577,19 +2598,10 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                         if actual_qty_insurance is None or actual_qty_insurance <= Decimal('0'):
                             log("❌ Insurance leg fill failed. Continuing with main leg only.", telegram_bot, telegram_chat_id)
                         else:
-                            # Update insurance trade state with actual filled quantity
-                            insurance_trade_state.qty = actual_qty_insurance
-                            log("🛡️ Placing insurance protective orders...", telegram_bot, telegram_chat_id)
-                            place_orders(client, symbol, insurance_trade_state, tick_size, telegram_bot, telegram_chat_id)
-                        
-                        if actual_qty_insurance and actual_qty_insurance > Decimal('0'):
-                            # Create insurance trade state
-                            insurance_trade_state = TradeState()
+                            # Update insurance trade state with actual filled quantity and entry price
                             insurance_trade_state.active = True
-                            insurance_trade_state.leg_type = "INSURANCE"
                             insurance_trade_state.entry_price = actual_fill_price_dec
                             insurance_trade_state.qty = actual_qty_insurance
-                            insurance_trade_state.side = "LONG" if insurance_side == "BUY" else "SHORT"
                             insurance_trade_state.entry_close_time = latest_close_ms
                             insurance_trade_state.risk = actual_fill_price_dec * SL_PCT
                             insurance_trade_state.trail_activated = False
@@ -2599,18 +2611,16 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                             
                             # Calculate insurance SL and TP based on MAIN direction
                             if original_side == "BUY":  # MAIN LONG → insurance SHORT
-                                # SL = entry - 1R
-                                # TP = entry - 1.25R
-                                sl_price_dec = actual_fill_price_dec - R
+                                # For SHORT: SL above entry, TP below entry
+                                sl_price_dec = actual_fill_price_dec + R
                                 tp_price_dec = actual_fill_price_dec - (R * Decimal("1.25"))
-                                sl_rounding = ROUND_DOWN
+                                sl_rounding = ROUND_UP
                                 tp_rounding = ROUND_DOWN
                             else:  # MAIN SHORT → insurance LONG
-                                # SL = entry + 1R
-                                # TP = entry + 1.25R
-                                sl_price_dec = actual_fill_price_dec + R
+                                # For LONG: SL below entry, TP above entry
+                                sl_price_dec = actual_fill_price_dec - R
                                 tp_price_dec = actual_fill_price_dec + (R * Decimal("1.25"))
-                                sl_rounding = ROUND_UP
+                                sl_rounding = ROUND_DOWN
                                 tp_rounding = ROUND_UP
                             
                             insurance_trade_state.sl = quantize_price(sl_price_dec, tick_size, sl_rounding)
@@ -2626,12 +2636,13 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                                 f"Qty: {actual_qty_insurance:.5f} SOL\n"
                                 f"SL: {insurance_trade_state.sl:.4f} (1R)\n"
                                 f"TP: {insurance_trade_state.tp:.4f} (1.25R)\n"
-                                f"Virtual Capital: ${INSURANCE_VIRTUAL_CAPITAL}\n"
+                                f"Virtual Capital: ${ins_virtual_equity:.2f}\n"
                                 f"Trailing: DISABLED"
                             )
                             telegram_post(telegram_bot, telegram_chat_id, tg_msg_insurance)
                             
                             # Place insurance protective orders
+                            log("🛡️ Placing insurance protective orders...", telegram_bot, telegram_chat_id)
                             place_orders(client, symbol, insurance_trade_state, tick_size, telegram_bot, telegram_chat_id)
                             
                             # Store insurance trade state
@@ -2646,8 +2657,6 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                                 daemon=True
                             ).start()
                             log(f"Insurance leg monitoring started", telegram_bot, telegram_chat_id)
-                        else:
-                            log("Insurance leg fill failed. Continuing with main leg only.", telegram_bot, telegram_chat_id)
                 
                 trades_today += 1
                 pending_entry = False
