@@ -1552,26 +1552,26 @@ def fetch_balance(client: BinanceClient) -> Decimal:
 def trading_allowed(client: BinanceClient, symbol: str, telegram_bot: Optional[str], telegram_chat_id: Optional[str]) -> bool:
     """Simple check for weekly DD and consecutive loss guards"""
     global bot_state
-    # 1. Weekly DD Guard (20% hard stop) - DISABLED
-    # current_balance = fetch_balance(client)
-    # risk_allowed = get_current_risk_pct(
-    #     current_equity=current_balance,
-    #     client=client,
-    #     symbol=symbol,
-    #     telegram_bot=telegram_bot,
-    #     telegram_chat_id=telegram_chat_id
-    # )
-    # if risk_allowed <= Decimal("0"):
-    #     return False  # Weekly DD stop triggered
+    # 1. Weekly DD Guard (20% hard stop)
+    current_balance = fetch_balance(client)
+    risk_allowed = get_current_risk_pct(
+        current_equity=current_balance,
+        client=client,
+        symbol=symbol,
+        telegram_bot=telegram_bot,
+        telegram_chat_id=telegram_chat_id
+    )
+    if risk_allowed <= Decimal("0"):
+        return False  # Weekly DD stop triggered
     
-    # 2. Consecutive Loss Guard - DISABLED
-    # if bot_state.USE_CONSEC_LOSS_GUARD and bot_state.CONSEC_LOSSES >= bot_state.MAX_CONSEC_LOSSES:
-    #     if not bot_state.consec_loss_guard_alert_sent:
-    #         log(f"CONSECUTIVE FULL LOSSES REACHED ({bot_state.CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
-    #         bot_state.consec_loss_guard_alert_sent = True
-    #     return False
+    # 2. Consecutive Loss Guard
+    if bot_state.USE_CONSEC_LOSS_GUARD and bot_state.CONSEC_LOSSES >= bot_state.MAX_CONSEC_LOSSES:
+        if not bot_state.consec_loss_guard_alert_sent:
+            log(f"CONSECUTIVE FULL LOSSES REACHED ({bot_state.CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
+            bot_state.consec_loss_guard_alert_sent = True
+        return False
   
-    return True  # Always allowed - ALL GUARDS DISABLED
+    return True
 
 def has_active_position(client: BinanceClient, symbol: str, telegram_bot: Optional[str] = None, telegram_chat_id: Optional[str] = None) -> bool:
     try:
@@ -2972,49 +2972,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("\n".join(status_lines), parse_mode='Markdown')
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command: /status — quick bot health check"""
-    global bot_state, args
-    
-    chat_id = str(update.effective_chat.id)
-    
-    if chat_id != str(args.chat_id):
-        await update.message.reply_text("❌ Unauthorized.")
-        return
-    
-    balance = fetch_balance(bot_state.client) if bot_state.client else Decimal("0")
-    # Get net position amount for display
-    pos_amt = get_position_amt(bot_state.client, args.symbol, args.telegram_token, args.chat_id) if bot_state.client else Decimal("0")
-    
-    import psutil
-    process = psutil.Process()
-    mem_mb = process.memory_info().rss / 1024 / 1024
-    
-    main_status = "No active trade"
-    if bot_state.current_trade and bot_state.current_trade.active:
-        main_status = f"{bot_state.current_trade.side} @ {bot_state.current_trade.entry_price:.2f} | Qty: {bot_state.current_trade.qty:.4f}"
-    
-    insurance_status = "Not active"
-    if bot_state.INSURANCE_ACTIVE and bot_state.insurance_trade and bot_state.insurance_trade.active:
-        insurance_status = f"{bot_state.insurance_trade.side} @ {bot_state.insurance_trade.entry_price:.2f} | Qty: {bot_state.insurance_trade.qty:.4f}"
-    
-    status_lines = [
-        f"🤖 *Edison Bot Status*",
-        f"",
-        f"📊 *Balance:* `${float(balance):.2f}`",
-        f"📈 *Net Position:* `{float(pos_amt):.2f} SOL`",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"📌 *MAIN Leg:* `{main_status}`",
-        f"🛡️ *INSURANCE Leg:* `{insurance_status}`",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"💾 *Trades Stored:* `{len(bot_state.pnl_data)}`",
-        f"🧠 *Memory:* `{mem_mb:.1f} MB`",
-        f"🆔 *PID:* `{os.getpid()}`",
-        f"⏰ *Uptime:* `{datetime.now(timezone.utc) - bot_state.start_time}`" if hasattr(bot_state, 'start_time') else ""
-    ]
-    
-    await update.message.reply_text("\n".join(status_lines), parse_mode='Markdown')
-
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command: /help — show available commands"""
     chat_id = str(update.effective_chat.id)
@@ -3088,14 +3045,14 @@ if __name__ == "__main__":
     bot_state.weekly_peak_equity = None
     bot_state.weekly_dd_alert_triggered = False
     log("⚠️ WEEKLY DRAWDOWN GUARD RESET - TRADING ENABLED", args.telegram_token, args.chat_id)
-    # ======================== SAFE RESTART & SHUTDOWN ========================
+# ===========================================
+        # ======================== SINGLE, BULLETPROOF SHUTDOWN ========================
     _shutdown_done = False
-
+    
     def graceful_shutdown(sig: Optional[int] = None, frame: Any = None, 
                           symbol: Optional[str] = None, 
                           telegram_bot: Optional[str] = None, 
-                          telegram_chat_id: Optional[str] = None,
-                          is_restart: bool = False):
+                          telegram_chat_id: Optional[str] = None):
         global _shutdown_done, bot_state, args, LOCK_HANDLE
         
         symbol = symbol or getattr(args, 'symbol', None)
@@ -3114,89 +3071,84 @@ if __name__ == "__main__":
         if os.path.exists("/tmp/STOP_BOT_NOW"):
             reason = "KILL FLAG / Manual stop"
 
-        log(f"🛑 Shutdown requested ({reason}) | Restart mode: {is_restart}", telegram_bot, telegram_chat_id)
-
-        # Save state
+        log(f"🛑 Shutdown requested ({reason}). Starting clean closure...", telegram_bot, telegram_chat_id)
+        
+        # Save state first
         try:
             save_bot_state()
         except Exception as e:
             log(f"Warning: Failed to save state: {e}", telegram_bot, telegram_chat_id)
 
-        # === IMPORTANT: On normal stop → close positions. On restart → preserve ===
-        if not is_restart:
-            log("Normal shutdown → Closing all positions...", telegram_bot, telegram_chat_id)
-            if bot_state.client and symbol:
-                try:
-                    _request_stop(symbol=symbol, telegram_bot=telegram_bot, telegram_chat_id=telegram_chat_id)
-                except Exception as e:
-                    log(f"Error closing positions: {e}", telegram_bot, telegram_chat_id)
-        else:
-            log("🔄 RESTART mode → PRESERVING active positions and orders on Binance", telegram_bot, telegram_chat_id)
-            # Do NOT call _request_stop — just let positions stay open
-
-        # Final order cleanup only on full stop
-        if not is_restart:
+        # === CRITICAL: Actually close positions using _request_stop ===
+        if bot_state.client and symbol:
+            log("Calling _request_stop to close positions...", telegram_bot, telegram_chat_id)
             try:
-                if bot_state.client and symbol:
-                    bot_state.client.cancel_all_open_orders(symbol)
-            except:
-                pass
+                _request_stop(
+                    symbol=symbol,
+                    telegram_bot=telegram_bot,
+                    telegram_chat_id=telegram_chat_id
+                )
+            except Exception as e:
+                log(f"Error during _request_stop: {e}", telegram_bot, telegram_chat_id)
+        else:
+            log("No client or symbol available — skipping position closure", telegram_bot, telegram_chat_id)
 
-        # Clear local state
+        # Final order cleanup (just in case)
+        try:
+            if bot_state.client and symbol:
+                bot_state.client.cancel_all_open_orders(symbol)
+                log(f"All open orders cancelled for {symbol}.", telegram_bot, telegram_chat_id)
+        except Exception as e:
+            log(f"Final order cleanup failed: {e}", telegram_bot, telegram_chat_id)
+
+        # Clear states
         bot_state.current_trade = None
         bot_state.insurance_trade = None
         bot_state.INSURANCE_ACTIVE = False
 
         goodbye = (
-            f"✅ RSI BOT {'RESTARTING' if is_restart else 'STOPPED'}\n"
+            f"✅ RSI BOT STOPPED CLEANLY\n"
             f"Symbol: {symbol}\n"
             f"Timeframe: {getattr(args, 'timeframe', 'N/A')}\n"
             f"Reason: {reason}\n"
             f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-            f"Insurance: {'ENABLED' if INSURANCE_ENABLED else 'DISABLED'}"
+            f"Insurance Mode: {'ENABLED' if INSURANCE_ENABLED else 'DISABLED'}\n"
+            f"Positions: Closed successfully"
         )
-        
-        if is_restart:
-            goodbye += "\n🔄 Positions preserved on Binance - bot will re-attach after restart"
 
         try:
             log(goodbye, telegram_bot, telegram_chat_id)
-        except:
-            pass
+        except Exception as e:
+            print(f"Error sending goodbye message: {e}")
 
-        # Clean lock
-        try:
-            if LOCK_HANDLE:
-                LOCK_HANDLE.close()
-            if os.path.exists(LOCK_FILE):
-                os.unlink(LOCK_FILE)
-        except:
-            pass
-
-        if os.path.exists("/tmp/STOP_BOT_NOW"):
+        # Clean up lock file
+        if sig is not None:
             try:
+                if LOCK_HANDLE:
+                    LOCK_HANDLE.close()
+                if os.path.exists(LOCK_FILE):
+                    os.unlink(LOCK_FILE)
+                    log(f"Lock file removed: {LOCK_FILE}", telegram_bot, telegram_chat_id)
+            except Exception as e:
+                print(f"Error cleaning lock file: {e}")
+
+        # Remove kill flag if exists
+        try:
+            if os.path.exists("/tmp/STOP_BOT_NOW"):
                 os.unlink("/tmp/STOP_BOT_NOW")
-            except:
-                pass
+        except:
+            pass
 
-        log(f"Bot {'restarting' if is_restart else 'shutting down'}...", telegram_bot, telegram_chat_id)
+        log("Bot shutdown completed. Exiting.", telegram_bot, telegram_chat_id)
+        os._exit(0)
         
-        if is_restart:
-            # Real restart
-            time.sleep(2)
-            import os, sys
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-        else:
-            os._exit(0)
-
-
     def signal_handler_wrapper(sig, frame):
-        graceful_shutdown(sig, frame, args.symbol, args.telegram_token, args.chat_id, is_restart=False)
+        graceful_shutdown(sig, frame, args.symbol, args.telegram_token, args.chat_id)
     
-    # Register signals
+    # Register signals and atexit
     signal.signal(signal.SIGINT, signal_handler_wrapper)
     signal.signal(signal.SIGTERM, signal_handler_wrapper)
-    atexit.register(lambda: graceful_shutdown(None, None, args.symbol, args.telegram_token, args.chat_id, is_restart=False))
+    atexit.register(lambda: graceful_shutdown(None, None, args.symbol, args.telegram_token, args.chat_id))
     
     # ======================== IMMORTAL BOT LOOP ========================
     while True:
