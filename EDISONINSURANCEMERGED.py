@@ -491,7 +491,7 @@ def check_weekly_drawdown_stop(current_equity: Decimal, symbol: str, telegram_bo
     now = datetime.now(timezone.utc)
     current_monday = now - timedelta(days=now.weekday())
     current_monday = current_monday.replace(hour=0, minute=0, second=0, microsecond=0)
-    # log(f"DEBUG: Today={now.date()} Weekday={now.weekday()} WeeklyStart={bot_state.weekly_start_time} ConsecLosses={bot_state.CONSEC_LOSSES}", telegram_bot, telegram_chat_id)
+    log(f"DEBUG: Today={now.date()} Weekday={now.weekday()} WeeklyStart={bot_state.weekly_start_time} ConsecLosses={bot_state.CONSEC_LOSSES}", telegram_bot, telegram_chat_id)
     
     current_week_monday = now - timedelta(days=now.weekday())
     current_week_monday = current_week_monday.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1552,26 +1552,26 @@ def fetch_balance(client: BinanceClient) -> Decimal:
 def trading_allowed(client: BinanceClient, symbol: str, telegram_bot: Optional[str], telegram_chat_id: Optional[str]) -> bool:
     """Simple check for weekly DD and consecutive loss guards"""
     global bot_state
-    # 1. Weekly DD Guard (20% hard stop) - DISABLED
-    # current_balance = fetch_balance(client)
-    # risk_allowed = get_current_risk_pct(
-    #     current_equity=current_balance,
-    #     client=client,
-    #     symbol=symbol,
-    #     telegram_bot=telegram_bot,
-    #     telegram_chat_id=telegram_chat_id
-    # )
-    # if risk_allowed <= Decimal("0"):
-    #     return False  # Weekly DD stop triggered
+    # 1. Weekly DD Guard (20% hard stop)
+    current_balance = fetch_balance(client)
+    risk_allowed = get_current_risk_pct(
+        current_equity=current_balance,
+        client=client,
+        symbol=symbol,
+        telegram_bot=telegram_bot,
+        telegram_chat_id=telegram_chat_id
+    )
+    if risk_allowed <= Decimal("0"):
+        return False  # Weekly DD stop triggered
     
-    # 2. Consecutive Loss Guard - DISABLED
-    # if bot_state.USE_CONSEC_LOSS_GUARD and bot_state.CONSEC_LOSSES >= bot_state.MAX_CONSEC_LOSSES:
-    #     if not bot_state.consec_loss_guard_alert_sent:
-    #         log(f"CONSECUTIVE FULL LOSSES REACHED ({bot_state.CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
-    #         bot_state.consec_loss_guard_alert_sent = True
-    #     return False
+    # 2. Consecutive Loss Guard
+    if bot_state.USE_CONSEC_LOSS_GUARD and bot_state.CONSEC_LOSSES >= bot_state.MAX_CONSEC_LOSSES:
+        if not bot_state.consec_loss_guard_alert_sent:
+            log(f"CONSECUTIVE FULL LOSSES REACHED ({bot_state.CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
+            bot_state.consec_loss_guard_alert_sent = True
+        return False
   
-    return True  # Always allowed - ALL GUARDS DISABLED
+    return True
 
 def has_active_position(client: BinanceClient, symbol: str, telegram_bot: Optional[str] = None, telegram_chat_id: Optional[str] = None) -> bool:
     try:
