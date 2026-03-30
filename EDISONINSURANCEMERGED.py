@@ -491,7 +491,7 @@ def check_weekly_drawdown_stop(current_equity: Decimal, symbol: str, telegram_bo
     now = datetime.now(timezone.utc)
     current_monday = now - timedelta(days=now.weekday())
     current_monday = current_monday.replace(hour=0, minute=0, second=0, microsecond=0)
-    log(f"DEBUG: Today={now.date()} Weekday={now.weekday()} WeeklyStart={bot_state.weekly_start_time} ConsecLosses={bot_state.CONSEC_LOSSES}", telegram_bot, telegram_chat_id)
+    # log(f"DEBUG: Today={now.date()} Weekday={now.weekday()} WeeklyStart={bot_state.weekly_start_time} ConsecLosses={bot_state.CONSEC_LOSSES}", telegram_bot, telegram_chat_id)
     
     current_week_monday = now - timedelta(days=now.weekday())
     current_week_monday = current_week_monday.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1552,26 +1552,26 @@ def fetch_balance(client: BinanceClient) -> Decimal:
 def trading_allowed(client: BinanceClient, symbol: str, telegram_bot: Optional[str], telegram_chat_id: Optional[str]) -> bool:
     """Simple check for weekly DD and consecutive loss guards"""
     global bot_state
-    # 1. Weekly DD Guard (20% hard stop)
-    current_balance = fetch_balance(client)
-    risk_allowed = get_current_risk_pct(
-        current_equity=current_balance,
-        client=client,
-        symbol=symbol,
-        telegram_bot=telegram_bot,
-        telegram_chat_id=telegram_chat_id
-    )
-    if risk_allowed <= Decimal("0"):
-        return False  # Weekly DD stop triggered
+    # 1. Weekly DD Guard (20% hard stop) - DISABLED
+    # current_balance = fetch_balance(client)
+    # risk_allowed = get_current_risk_pct(
+    #     current_equity=current_balance,
+    #     client=client,
+    #     symbol=symbol,
+    #     telegram_bot=telegram_bot,
+    #     telegram_chat_id=telegram_chat_id
+    # )
+    # if risk_allowed <= Decimal("0"):
+    #     return False  # Weekly DD stop triggered
     
-    # 2. Consecutive Loss Guard
-    if bot_state.USE_CONSEC_LOSS_GUARD and bot_state.CONSEC_LOSSES >= bot_state.MAX_CONSEC_LOSSES:
-        if not bot_state.consec_loss_guard_alert_sent:
-            log(f"CONSECUTIVE FULL LOSSES REACHED ({bot_state.CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
-            bot_state.consec_loss_guard_alert_sent = True
-        return False
+    # 2. Consecutive Loss Guard - DISABLED
+    # if bot_state.USE_CONSEC_LOSS_GUARD and bot_state.CONSEC_LOSSES >= bot_state.MAX_CONSEC_LOSSES:
+    #     if not bot_state.consec_loss_guard_alert_sent:
+    #         log(f"CONSECUTIVE FULL LOSSES REACHED ({bot_state.CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
+    #         bot_state.consec_loss_guard_alert_sent = True
+    #     return False
   
-    return True
+    return True  # Always allowed - ALL GUARDS DISABLED
 
 def has_active_position(client: BinanceClient, symbol: str, telegram_bot: Optional[str] = None, telegram_chat_id: Optional[str] = None) -> bool:
     try:
@@ -2871,7 +2871,7 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
 
 # ==================== TELEGRAM COMMAND HANDLERS ====================
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Telegram /restart - safely restarts bot while preserving positions"""
+    """Telegram /restart - safely restarts bot, preserves positions"""
     global bot_state, args, LOCK_HANDLE
     
     chat_id = str(update.effective_chat.id)
@@ -2880,52 +2880,97 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Unauthorized.")
         return
     
-    # Check current positions for user message
     has_position = False
     position_details = ""
-    
     if (bot_state.client and bot_state.current_trade and 
         bot_state.current_trade.active and bot_state.current_trade.qty):
         has_position = True
         position_details = (f"MAIN: {bot_state.current_trade.side} "
-                           f"{bot_state.current_trade.qty:.5f} SOL "
-                           f"@ {bot_state.current_trade.entry_price:.4f}")
+                           f"{bot_state.current_trade.qty} SOL "
+                           f"@ {bot_state.current_trade.entry_price:.2f}")
     
     if bot_state.INSURANCE_ACTIVE and bot_state.insurance_trade and bot_state.insurance_trade.qty:
         has_position = True
         position_details += (f"\nINSURANCE: {bot_state.insurance_trade.side} "
-                            f"{bot_state.insurance_trade.qty:.5f} SOL "
-                            f"@ {bot_state.insurance_trade.entry_price:.4f}")
-
+                            f"{bot_state.insurance_trade.qty} SOL "
+                            f"@ {bot_state.insurance_trade.entry_price:.2f}")
+    
     if has_position:
         await update.message.reply_text(
             f"🔄 *Restarting with ACTIVE POSITIONS*\n\n"
             f"📊 *Positions:*\n{position_details}\n\n"
-            f"🛡️ *SL/TP/Trailing orders will stay on Binance*\n"
-            f"🤖 Bot will re-attach monitoring after restart\n\n"
+            f"🛡️ *SL/TP orders stay on Binance*\n"
+            f"🤖 Bot will resume monitoring after restart\n\n"
             f"Restarting in 2 seconds...",
             parse_mode='Markdown'
         )
     else:
         await update.message.reply_text("🔄 Restarting bot now...")
-
+    
     try:
         save_bot_state()
-        await update.message.reply_text("💾 Trade history & state saved")
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Save warning: {str(e)[:100]}")
-
-    log("🔧 Manual restart requested via Telegram", args.telegram_token, args.chat_id)
-
+        await update.message.reply_text("💾 Trade history saved")
+    except:
+        await update.message.reply_text("⚠️ Save warning - restarting anyway")
+    
+    log("🔧 Manual restart via Telegram", args.telegram_token, args.chat_id)
+    
     await asyncio.sleep(2)
+    
+    try:
+        if LOCK_HANDLE:
+            LOCK_HANDLE.close()
+            print("Lock handle closed successfully for restart")
+    except Exception as e:
+        print(f"Error closing lock handle during restart: {e}")
+    
+    time.sleep(1)
+    
+    import os, sys
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
-    # Use graceful_shutdown with restart mode = True
-    graceful_shutdown(
-        symbol=args.symbol,
-        telegram_bot=args.telegram_token,
-        telegram_chat_id=args.chat_id,
-        is_restart=True
-    )
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command: /status — quick bot health check"""
+    global bot_state, args
+    
+    chat_id = str(update.effective_chat.id)
+    
+    if chat_id != str(args.chat_id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    
+    balance = fetch_balance(bot_state.client) if bot_state.client else Decimal("0")
+    # Get net position amount for display
+    pos_amt = get_position_amt(bot_state.client, args.symbol, args.telegram_token, args.chat_id) if bot_state.client else Decimal("0")
+    
+    import psutil
+    process = psutil.Process()
+    mem_mb = process.memory_info().rss / 1024 / 1024
+    
+    main_status = "No active trade"
+    if bot_state.current_trade and bot_state.current_trade.active:
+        main_status = f"{bot_state.current_trade.side} @ {bot_state.current_trade.entry_price:.2f} | Qty: {bot_state.current_trade.qty:.4f}"
+    
+    insurance_status = "Not active"
+    if bot_state.INSURANCE_ACTIVE and bot_state.insurance_trade and bot_state.insurance_trade.active:
+        insurance_status = f"{bot_state.insurance_trade.side} @ {bot_state.insurance_trade.entry_price:.2f} | Qty: {bot_state.insurance_trade.qty:.4f}"
+    
+    status_lines = [
+        f"🤖 *Edison Bot Status*",
+        f"",
+        f"📊 *Balance:* `${float(balance):.2f}`",
+        f"📈 *Net Position:* `{float(pos_amt):.2f} SOL`",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"📌 *MAIN Leg:* `{main_status}`",
+        f"🛡️ *INSURANCE Leg:* `{insurance_status}`",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"💾 *Trades Stored:* `{len(bot_state.pnl_data)}`",
+        f"🧠 *Memory:* `{mem_mb:.1f} MB`",
+        f"🆔 *PID:* `{os.getpid()}`",
+        f"⏰ *Uptime:* `{datetime.now(timezone.utc) - bot_state.start_time}`" if hasattr(bot_state, 'start_time') else ""
+    ]
+    
+    await update.message.reply_text("\n".join(status_lines), parse_mode='Markdown')
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command: /status — quick bot health check"""
