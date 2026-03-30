@@ -42,7 +42,7 @@ VOL_SMA_PERIOD = 16
 RSI_PERIOD = 14
 MAX_TRADES_PER_DAY = 1
 INTERVAL_DEFAULT = "45m"
-ORDER_FILL_TIMEOUT = 60
+ORDER_FILL_TIMEOUT = 90
 BUY_RSI_MIN = Decimal("55")
 BUY_RSI_MAX = Decimal("65")
 SELL_RSI_MIN = Decimal("35")
@@ -60,7 +60,7 @@ POLLING_INTERVAL = 3  # Polling interval after WS failure
 
 # ==================== INSURANCE / HEDGE MODE CONFIGURATION ====================
 INSURANCE_ENABLED = True            # Master switch for insurance leg
-INSURANCE_DELAY_MS = 400            # Delay before opening insurance leg (ms)
+INSURANCE_DELAY_MS = 1200            # Delay before opening insurance leg (ms)
 SAFETY_FACTOR = Decimal("0.90")      # 50% safety factor (as requested)
 
 # Virtual split configuration (emulating two separate accounts)
@@ -491,7 +491,7 @@ def check_weekly_drawdown_stop(current_equity: Decimal, symbol: str, telegram_bo
     now = datetime.now(timezone.utc)
     current_monday = now - timedelta(days=now.weekday())
     current_monday = current_monday.replace(hour=0, minute=0, second=0, microsecond=0)
-    log(f"DEBUG: Today={now.date()} Weekday={now.weekday()} WeeklyStart={bot_state.weekly_start_time} ConsecLosses={bot_state.CONSEC_LOSSES}", telegram_bot, telegram_chat_id)
+    # log(f"DEBUG: Today={now.date()} Weekday={now.weekday()} WeeklyStart={bot_state.weekly_start_time} ConsecLosses={bot_state.CONSEC_LOSSES}", telegram_bot, telegram_chat_id)
     
     current_week_monday = now - timedelta(days=now.weekday())
     current_week_monday = current_week_monday.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -848,99 +848,94 @@ def daily_memory_log(bot: Optional[str] = None, chat_id: Optional[str] = None):
         
 # ------------------- STOP HANDLER (IDEMPOTENT) WITH DECIMAL -------------------
 def _request_stop(signum: Optional[int] = None, frame: Any = None, symbol: Optional[str] = None, 
-                  telegram_bot: Optional[str] = None, telegram_chat_id: Optional[str] = None,
-                  close_main: bool = True, close_insurance: bool = True):
+                  telegram_bot: Optional[str] = None, telegram_chat_id: Optional[str] = None):
     global bot_state
+    
     with bot_state._stop_lock:
         if bot_state.STOP_REQUESTED:
             logger.info("Stop already requested; skipping duplicate cleanup.")
             return
         bot_state.STOP_REQUESTED = True
     
-    # ADD THIS: Set flag to prevent monitor_trade from also processing closure
     bot_state._position_closure_in_progress = True
-    
-    log("Stop requested. Closing positions and cancelling orders...", telegram_bot, telegram_chat_id)
-    
+    log("🛑 STOP REQUESTED — Closing ALL positions and cancelling orders...", telegram_bot, telegram_chat_id)
+
     if not bot_state.client or not symbol:
-        log("Client or symbol not defined; skipping position closure and order cancellation.", telegram_bot, telegram_chat_id)
-        bot_state._position_closure_in_progress = False  # CLEAR FLAG
+        log("Client or symbol not available. Skipping closure.", telegram_bot, telegram_chat_id)
+        bot_state._position_closure_in_progress = False
         return
-    
+
+    closed_positions = False
+
     try:
-        # Get all positions for symbol
+        # Get fresh positions
         pos_resp = bot_state.client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        positions = pos_resp['data'] if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp if isinstance(pos_resp, list) else []
-        
-        # Loop through each position side (in hedge mode there can be both)
+        positions = pos_resp.get('data') if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp
+        if not isinstance(positions, list):
+            positions = [positions] if isinstance(positions, dict) else []
+
         for pos in positions:
-            if not isinstance(pos, dict):
+            if not isinstance(pos, dict) or pos.get("symbol") != symbol:
                 continue
-            if pos.get("symbol") != symbol:
-                continue
+
             pos_amt = Decimal(str(pos.get("positionAmt", "0")))
             if pos_amt == Decimal('0'):
                 continue
-            
-            side = "SELL" if pos_amt > Decimal('0') else "BUY"
+
+            position_side = pos.get("positionSide")
+            entry_price_dec = Decimal(str(pos.get("entryPrice", "0")))
             qty = abs(pos_amt)
-            position_side = pos.get("positionSide")  # "LONG" or "SHORT" in hedge mode
-            
-            # Determine leg type based on positionSide
+            close_side = "SELL" if pos_amt > Decimal('0') else "BUY"
+
+            # Determine leg type
             leg_type = "UNKNOWN"
-            if bot_state.current_trade and bot_state.current_trade.active:
-                if (position_side == "LONG" and bot_state.current_trade.side == "LONG") or \
-                   (position_side == "SHORT" and bot_state.current_trade.side == "SHORT"):
-                    leg_type = "MAIN"
-            if bot_state.insurance_trade and bot_state.insurance_trade.active:
-                if (position_side == "LONG" and bot_state.insurance_trade.side == "LONG") or \
-                   (position_side == "SHORT" and bot_state.insurance_trade.side == "SHORT"):
-                    leg_type = "INSURANCE"
-            
-            # Place market close with positionSide if available
+            if bot_state.current_trade and bot_state.current_trade.active and position_side == bot_state.current_trade.side:
+                leg_type = "MAIN"
+            elif bot_state.insurance_trade and bot_state.insurance_trade.active and position_side == bot_state.insurance_trade.side:
+                leg_type = "INSURANCE"
+
+            log(f"Closing {leg_type} leg → {position_side} | Qty: {qty} | Side: {close_side}", 
+                telegram_bot, telegram_chat_id)
+
+            # Place market close
             order_params = {
                 "symbol": symbol,
-                "side": side,
+                "side": close_side,
                 "type": "MARKET",
                 "quantity": str(qty)
             }
             if position_side:
                 order_params["positionSide"] = position_side
+
             response = bot_state.client.send_signed_request("POST", "/fapi/v1/order", order_params)
             market_order_id = response.get("orderId")
-            log(f"Closed position: {leg_type} leg | side={position_side} qty={qty} {side} (orderId: {market_order_id})", telegram_bot, telegram_chat_id)
-            
-            # === Get EXACT fill price from userTrades (not ticker fallback) ===
-            exit_price_dec: Optional[Decimal] = None
-            if market_order_id:
-                time.sleep(0.8)  # Allow fill propagation
-                try:
-                    trades = bot_state.client.send_signed_request("GET", "/fapi/v1/userTrades", {
-                        "symbol": symbol,
-                        "orderId": market_order_id,
-                        "limit": 10
-                    })
-                    filled_trades = [t for t in trades if Decimal(str(t.get("qty", "0"))) > Decimal('0')]
-                    if filled_trades:
-                        # Use last fill (most accurate)
-                        exit_price_dec = Decimal(str(filled_trades[-1]["price"]))
-                except Exception as e:
-                    log(f"Failed to fetch exact fill from userTrades: {e}", telegram_bot, telegram_chat_id)
-            
-            if exit_price_dec is None:
-                log("⚠️ Exact fill price unavailable. Using ticker as last resort.", telegram_bot, telegram_chat_id)
+
+            # Wait longer for fill confirmation
+            time.sleep(1.5)
+
+            # Get exact exit price
+            exit_price_dec = Decimal("0")
+            try:
+                trades = bot_state.client.send_signed_request("GET", "/fapi/v1/userTrades", {
+                    "symbol": symbol,
+                    "orderId": market_order_id,
+                    "limit": 10
+                })
+                filled = [t for t in trades if Decimal(str(t.get("qty", "0"))) > Decimal('0')]
+                if filled:
+                    exit_price_dec = Decimal(str(filled[-1]["price"]))
+            except Exception as e:
+                log(f"Failed to get exact fill price: {e}", telegram_bot, telegram_chat_id)
+
+            if exit_price_dec == Decimal("0"):
                 try:
                     ticker = bot_state.client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
                     exit_price_dec = Decimal(str(ticker.get("price", "0")))
-                except Exception as e:
-                    log(f"Ticker fallback failed: {e}", telegram_bot, telegram_chat_id)
-                    exit_price_dec = Decimal("0")
-            
-            # Get entry price from position details
-            entry_price_dec = Decimal(str(pos.get("entryPrice", "0")))
+                except:
+                    pass
+
+            # Log PNL
             R = entry_price_dec * SL_PCT
-            
-            # Log PNL with Decimal values
             pnl_row = log_pnl(
                 len(bot_state.pnl_data) + 1,
                 "LONG" if pos_amt > Decimal('0') else "SHORT",
@@ -950,36 +945,47 @@ def _request_stop(signum: Optional[int] = None, frame: Any = None, symbol: Optio
                 R,
                 leg_type
             )
-            
-            # Telegram
-            if telegram_bot and telegram_chat_id:
-                send_closure_telegram(
-                    symbol=symbol,
-                    side="LONG" if pos_amt > Decimal('0') else "SHORT",
-                    entry_price=entry_price_dec,
-                    exit_price=exit_price_dec,
-                    qty=qty,
-                    pnl_usd=Decimal(str(pnl_row['pnl_usd'])),
-                    pnl_r=Decimal(str(pnl_row['pnl_r'])),
-                    reason="Stop Requested",
-                    leg_type=leg_type,
-                    bot=telegram_bot,
-                    chat_id=telegram_chat_id
-                )
-    
+
+            send_closure_telegram(
+                symbol=symbol,
+                side="LONG" if pos_amt > Decimal('0') else "SHORT",
+                entry_price=entry_price_dec,
+                exit_price=exit_price_dec,
+                qty=qty,
+                pnl_usd=Decimal(str(pnl_row.get('pnl_usd', 0))),
+                pnl_r=Decimal(str(pnl_row.get('pnl_r', 0))),
+                reason="Stop Requested",
+                leg_type=leg_type,
+                bot=telegram_bot,
+                chat_id=telegram_chat_id
+            )
+
+            closed_positions = True
+
+        if closed_positions:
+            log("✅ All positions successfully closed via market orders.", telegram_bot, telegram_chat_id)
+        else:
+            log("No open positions found at stop time.", telegram_bot, telegram_chat_id)
+
     except Exception as e:
-        log(f"Stop handler error while closing position: {str(e)}", telegram_bot, telegram_chat_id)
-    
-    # Final cleanup
-    with bot_state._stop_lock:
-        if not bot_state._orders_cancelled:
-            try:
-                bot_state.client.cancel_all_open_orders(symbol)
-                log(f"All open orders cancelled for {symbol}.", telegram_bot, telegram_chat_id)
-            except Exception as e:
-                log(f"Failed to cancel open orders: {e}", telegram_bot, telegram_chat_id)
-            bot_state._orders_cancelled = True
+        log(f"Error while closing positions: {str(e)}", telegram_bot, telegram_chat_id)
+
+    # Final order cleanup
+    try:
+        bot_state.client.cancel_all_open_orders(symbol)
+        log(f"All open orders cancelled for {symbol}.", telegram_bot, telegram_chat_id)
+    except Exception as e:
+        log(f"Order cancellation failed: {e}", telegram_bot, telegram_chat_id)
+
+    bot_state._orders_cancelled = True
     bot_state._position_closure_in_progress = False
+
+    # Clear bot state
+    bot_state.current_trade = None
+    bot_state.insurance_trade = None
+    bot_state.INSURANCE_ACTIVE = False
+
+    log("🛑 Stop process completed.", telegram_bot, telegram_chat_id)
     
 # ------------------- TIME SYNC -------------------
 def check_time_offset(base_url: str) -> Optional[float]:
@@ -1546,26 +1552,26 @@ def fetch_balance(client: BinanceClient) -> Decimal:
 def trading_allowed(client: BinanceClient, symbol: str, telegram_bot: Optional[str], telegram_chat_id: Optional[str]) -> bool:
     """Simple check for weekly DD and consecutive loss guards"""
     global bot_state
-    # 1. Weekly DD Guard (20% hard stop)
-    current_balance = fetch_balance(client)
-    risk_allowed = get_current_risk_pct(
-        current_equity=current_balance,
-        client=client,
-        symbol=symbol,
-        telegram_bot=telegram_bot,
-        telegram_chat_id=telegram_chat_id
-    )
-    if risk_allowed <= Decimal("0"):
-        return False  # Weekly DD stop triggered
+    # 1. Weekly DD Guard (20% hard stop) - DISABLED
+    # current_balance = fetch_balance(client)
+    # risk_allowed = get_current_risk_pct(
+    #     current_equity=current_balance,
+    #     client=client,
+    #     symbol=symbol,
+    #     telegram_bot=telegram_bot,
+    #     telegram_chat_id=telegram_chat_id
+    # )
+    # if risk_allowed <= Decimal("0"):
+    #     return False  # Weekly DD stop triggered
     
-    # 2. Consecutive Loss Guard
-    if bot_state.USE_CONSEC_LOSS_GUARD and bot_state.CONSEC_LOSSES >= bot_state.MAX_CONSEC_LOSSES:
-        if not bot_state.consec_loss_guard_alert_sent:
-            log(f"CONSECUTIVE FULL LOSSES REACHED ({bot_state.CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
-            bot_state.consec_loss_guard_alert_sent = True
-        return False
+    # 2. Consecutive Loss Guard - DISABLED
+    # if bot_state.USE_CONSEC_LOSS_GUARD and bot_state.CONSEC_LOSSES >= bot_state.MAX_CONSEC_LOSSES:
+    #     if not bot_state.consec_loss_guard_alert_sent:
+    #         log(f"CONSECUTIVE FULL LOSSES REACHED ({bot_state.CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
+    #         bot_state.consec_loss_guard_alert_sent = True
+    #     return False
   
-    return True
+    return True  # Always allowed - ALL GUARDS DISABLED
 
 def has_active_position(client: BinanceClient, symbol: str, telegram_bot: Optional[str] = None, telegram_chat_id: Optional[str] = None) -> bool:
     try:
@@ -1604,7 +1610,12 @@ def get_position_amt_for_side(client: BinanceClient, symbol: str, side: str) -> 
     except Exception as e:
         log(f"Failed to get position for side {side}: {e}")
         return Decimal('0')
-
+def has_any_active_leg() -> bool:
+    """Return True if MAIN or INSURANCE (or both) legs are still active."""
+    global bot_state
+    main_active = bot_state.current_trade is not None and bot_state.current_trade.active
+    ins_active = bot_state.insurance_trade is not None and bot_state.insurance_trade.active
+    return main_active or ins_active
 # ------------------- SLIPPAGE CHECK HELPER -------------------
 def _check_slippage(client: BinanceClient, symbol: str, entry_price: Decimal, 
                     telegram_bot: Optional[str], telegram_chat_id: Optional[str]) -> Tuple[bool, Decimal]:
@@ -2001,6 +2012,12 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
     
     try:
         while trade_state.active and not bot_state.STOP_REQUESTED:
+            # Respect emergency stop / closure in progress
+            if bot_state._position_closure_in_progress or bot_state.STOP_REQUESTED:
+                log(f"[{trade_state.leg_type}] Stop in progress - exiting monitor thread", telegram_bot, telegram_chat_id)
+                trade_state.active = False
+                return
+            
             if current_price is None:
                 time.sleep(1)
                 continue
@@ -2039,21 +2056,25 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
             # --- Position Check (for this leg's side) ---
             try:
                 pos_amt_side = get_position_amt_for_side(client, symbol, trade_state.side.upper())
+                
                 if pos_amt_side == Decimal('0') and trade_state.active:
                     if bot_state._position_closure_in_progress:
                         log(f"[{trade_state.leg_type}] Position closure already in progress. Skipping duplicate processing.", telegram_bot, telegram_chat_id)
                         trade_state.active = False
                         return
                     
-                    log(f"[{trade_state.leg_type}] Position closed (verified via positionAmt == 0). Determining exit reason...", telegram_bot, telegram_chat_id)
+                    log(f"[{trade_state.leg_type}] Position closed (verified via {trade_state.side} side positionAmt == 0). Determining exit reason...", telegram_bot, telegram_chat_id)
                     trade_state.active = False
                     time.sleep(1.2)
+                    
                     reason = "Unknown"
                     exit_price_dec: Optional[Decimal] = None
+                    
                     try:
                         algo_open_resp = client.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
                         algo_open = algo_open_resp if isinstance(algo_open_resp, list) else []
-                        open_algo_ids = {o.get("algoId") for o in algo_open if o.get("algoId")}
+                        open_algo_ids = {o.get("algoId") for o in algo_open if o.get("algoId") is not None}
+                        
                         sl_algo_id = trade_state.sl_algo_id
                         tp_algo_id = trade_state.tp_algo_id
                         trail_algo_id = trade_state.trail_algo_id
@@ -2093,6 +2114,8 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
                     exit_price = exit_price_dec if exit_price_dec else Decimal("0")
                     entry_price_safe = trade_state.entry_price or Decimal("0")
                     R = entry_price_safe * SL_PCT
+                    
+                    # === PNL LOGGING (exactly as you had it) ===
                     pnl_row = log_pnl(
                         len(bot_state.pnl_data) + 1,
                         trade_state.side or "UNKNOWN",
@@ -2120,23 +2143,55 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
                         chat_id=telegram_chat_id
                     )
                     
-                    # Clear the appropriate trade state
+                    # === TARGETED CLEANUP — Only this leg's orders ===
+                    try:
+                        algo_open_resp = client.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+                        algo_open = algo_open_resp if isinstance(algo_open_resp, list) else []
+                        
+                        leg_algo_ids = set()
+                        if trade_state.sl_algo_id:   leg_algo_ids.add(trade_state.sl_algo_id)
+                        if trade_state.tp_algo_id:   leg_algo_ids.add(trade_state.tp_algo_id)
+                        if trade_state.trail_algo_id: leg_algo_ids.add(trade_state.trail_algo_id)
+                        
+                        cancelled = 0
+                        for order in algo_open:
+                            algo_id = order.get("algoId")
+                            if algo_id and algo_id in leg_algo_ids:
+                                try:
+                                    client.send_signed_request("DELETE", "/fapi/v1/algoOrder", {
+                                        "symbol": symbol,
+                                        "algoId": str(algo_id)
+                                    })
+                                    log(f"[{trade_state.leg_type}] Cancelled its own algoId={algo_id}", telegram_bot, telegram_chat_id)
+                                    cancelled += 1
+                                    time.sleep(0.1)
+                                except Exception as e:
+                                    log(f"[{trade_state.leg_type}] Failed to cancel algoId={algo_id}: {e}", telegram_bot, telegram_chat_id)
+                        
+                        if cancelled == 0:
+                            log(f"[{trade_state.leg_type}] No remaining algo orders found for this leg.", telegram_bot, telegram_chat_id)
+                        
+                        # Only do full cleanup if BOTH legs are now inactive
+                        if not has_any_active_leg():
+                            client.cancel_all_open_orders(symbol)
+                            log(f"[ZOMBIE KILLER] Nuclear strike executed — all ghosts eliminated", telegram_bot, telegram_chat_id)
+                        else:
+                            log(f"[{trade_state.leg_type}] Leg closed — other leg still active. Its orders preserved.", telegram_bot, telegram_chat_id)
+                            
+                    except Exception as e:
+                        log(f"[{trade_state.leg_type}] Order cleanup error: {e}", telegram_bot, telegram_chat_id)
+                    
+                    # Clear only this leg's state
                     if trade_state.leg_type == "INSURANCE":
                         bot_state.insurance_trade = None
                         bot_state.INSURANCE_ACTIVE = False
                     else:
                         bot_state.current_trade = None
                     
-                    try:
-                        client.cancel_all_open_orders(symbol)
-                        log(f"[ZOMBIE KILLER] Nuclear strike executed — all ghosts eliminated", telegram_bot, telegram_chat_id)
-                    except Exception as e:
-                        log(f"Cleanup cancel failed: {e}", telegram_bot, telegram_chat_id)
-                    
                     bot_state._orders_cancelled = True
                     return
               
-                # --- Update High/Low ---
+                # --- Update High/Low for trailing (unchanged) ---
                 if current_price is not None:
                     if trade_state.side == "LONG":
                         if trade_state.highest_price is None or current_price > trade_state.highest_price:
@@ -2145,7 +2200,7 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
                         if trade_state.lowest_price is None or current_price < trade_state.lowest_price:
                             trade_state.lowest_price = current_price
                 
-                # --- TRAILING UPDATES (only for MAIN leg) ---
+                # --- TRAILING UPDATES (only for MAIN leg) — unchanged ---
                 if trade_state.leg_type == "MAIN" and trade_state.trail_activated and Decimal(str(time.time())) - trade_state.last_trail_alert >= TRAIL_UPDATE_THROTTLE and current_price is not None:
                     R_dec = trade_state.risk
                     updated = False
@@ -2210,59 +2265,69 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
                 log(f"[{trade_state.leg_type}] Error closing WebSocket: {e}", telegram_bot, telegram_chat_id)
 
 # ------------------- TRADING LOOP WITH DECIMAL -------------------
-def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_per_day: int, 
-                 risk_pct: Decimal, max_daily_loss_pct: Decimal, tp_mult: Decimal, 
-                 use_trailing: bool, prevent_same_bar: bool, require_no_pos: bool, 
-                 use_max_loss: bool, use_volume_filter: bool, telegram_bot: Optional[str], 
+def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_per_day: int,
+                 risk_pct: Decimal, max_daily_loss_pct: Decimal, tp_mult: Decimal,
+                 use_trailing: bool, prevent_same_bar: bool, require_no_pos: bool,
+                 use_max_loss: bool, use_volume_filter: bool, telegram_bot: Optional[str],
                  telegram_chat_id: Optional[str]):
     global bot_state
-    # Initialize local variables used in the loop
-    last_news_guard_msg = None
-    news_guard_was_active = False
-    last_no_klines_log = 0
-  
-    interval_seconds = interval_ms(timeframe) / 1000.0
+
+    # === STATE TRACKING FOR CLEAN LOGGING ===
+    last_position_state = "FLAT"
+    last_candle_logged_ms = None
+    last_trade_date = datetime.now(timezone.utc).date()
     trades_today = 0
-    last_processed_time = 0
-    trade_state = TradeState()
-    qty_api: Optional[Decimal] = None
     pending_entry = False
-  
-    # Get filters once
+    bot_state.max_trades_alert_sent = False
+
+    # Get symbol filters once (outside the loop)
     filters = get_symbol_filters(client, symbol)
     step_size = filters['stepSize']
-    min_qty = filters['minQty']
-    tick_size = filters['tickSize']
     min_notional = filters['minNotional']
-    bot_state.max_trades_alert_sent = False
-  
-    last_trade_date = datetime.now(timezone.utc).date()
-    log(f"Bot started on {last_trade_date}. Trades today: {trades_today}", telegram_bot, telegram_chat_id)
-    log(f"Starting bot with symbol={symbol}, timeframe={timeframe}, risk_pct={risk_pct*Decimal('100'):.1f}%")
-    if INSURANCE_ENABLED:
-        log(f"INSURANCE LEG: ENABLED | Full Hedge Mode | Virtual Split: MAIN ${MAIN_VIRTUAL_CAPITAL} | INSURANCE ${INSURANCE_VIRTUAL_CAPITAL} | Margin Usage: {MARGIN_USAGE_PCT*100:.0f}% | Safety Factor: {SAFETY_FACTOR*100:.0f}%",
+    tick_size = filters['tickSize']
+
+    log(f"🚀 Trading loop started → {symbol} | {timeframe} | Insurance: {'ENABLED' if INSURANCE_ENABLED else 'DISABLED'}",
         telegram_bot, telegram_chat_id)
-    # === MAIN TRADING LOOP ===
+
     while not bot_state.STOP_REQUESTED and not os.path.exists("stop.txt"):
         try:
-            # === IF IN TRADE → MONITOR BOTH LEGS ===
-            if trade_state.active:
-                monitor_trade(
-                    client, symbol, trade_state, tick_size,
-                    telegram_bot, telegram_chat_id,
-                    trade_state.entry_close_time or int(time.time() * 1000)
-                )
-                continue
-            
-            # Also monitor insurance leg if active
-            if bot_state.INSURANCE_ACTIVE and bot_state.insurance_trade:
-                monitor_trade(
-                    client, symbol, bot_state.insurance_trade, tick_size,
-                    telegram_bot, telegram_chat_id,
-                    bot_state.insurance_trade.entry_close_time or int(time.time() * 1000)
-                )
-                continue
-            
+            # === CRITICAL SAFETY CLEANUP ===
+            any_leg_active = has_any_active_leg()
+
+            # Sync real Binance position with bot state
+            try:
+                long_amt = get_position_amt_for_side(client, symbol, "LONG")
+                short_amt = get_position_amt_for_side(client, symbol, "SHORT")
+                real_position = abs(long_amt) + abs(short_amt)
+
+                if real_position == Decimal('0') and any_leg_active:
+                    log("⚠️ State desync: Binance flat but bot shows active trade → Resetting state",
+                        telegram_bot, telegram_chat_id)
+                    bot_state.current_trade = None
+                    bot_state.insurance_trade = None
+                    bot_state.INSURANCE_ACTIVE = False
+                    any_leg_active = False
+            except Exception as e:
+                log(f"Position verification error: {e}", telegram_bot, telegram_chat_id)
+
+            # Clear stale objects
+            if bot_state.current_trade and not bot_state.current_trade.active:
+                bot_state.current_trade = None
+            if bot_state.insurance_trade and not bot_state.insurance_trade.active:
+                bot_state.insurance_trade = None
+                bot_state.INSURANCE_ACTIVE = False
+
+            any_leg_active = has_any_active_leg()
+            current_state = "ACTIVE" if any_leg_active else "FLAT"
+
+            # === STATE CHANGE LOGGING ===
+            if current_state != last_position_state:
+                if current_state == "ACTIVE":
+                    log("🚀 POSITION OPENED → Entering silent monitoring mode", telegram_bot, telegram_chat_id)
+                else:
+                    log("✅ POSITION CLOSED → Resuming signal scanning", telegram_bot, telegram_chat_id)
+                last_position_state = current_state
+
             # === DAILY RESET ===
             now_date = datetime.now(timezone.utc).date()
             if last_trade_date != now_date:
@@ -2271,203 +2336,142 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 trades_today = 0
                 bot_state.max_trades_alert_sent = False
                 daily_start_balance = fetch_balance(client)
-                log(f"NEW DAY → {old_date} → {now_date} | Trades reset | Equity: ${daily_start_balance:.2f}", telegram_bot, telegram_chat_id)
-            
+                log(f"NEW DAY → {old_date} → {now_date} | Trades reset | Equity: ${daily_start_balance:.2f}",
+                    telegram_bot, telegram_chat_id)
+
             if trades_today >= max_trades_per_day:
                 if not bot_state.max_trades_alert_sent:
                     log(f"Max trades reached ({max_trades_per_day}). No more today.", telegram_bot, telegram_chat_id)
                     bot_state.max_trades_alert_sent = True
                 time.sleep(60)
                 continue
-            
+
             if not trading_allowed(client, symbol, telegram_bot, telegram_chat_id):
                 time.sleep(1)
                 continue
-          
-            current_balance = fetch_balance(client)
-            log(f"Risk allowed: {BASE_RISK_PCT:.3%}", telegram_bot, telegram_chat_id)
-            
-            # === FETCH KLINES & VALIDATE QUALITY ===
+
+            # === FETCH KLINES & VALIDATE ===
             klines = fetch_klines(client, symbol, timeframe)
             bot_state.is_testnet = True
             is_good, msg = ensure_tv_quality_data(klines, timeframe, is_testnet=bot_state.is_testnet)
             if not is_good:
-                log(f"Data quality failed: {msg}. Skipping this cycle.", telegram_bot, telegram_chat_id)
+                log(f"Data quality failed: {msg}. Skipping cycle.", telegram_bot, telegram_chat_id)
                 time.sleep(10)
                 continue
-            
+
             latest_close_ms = int(klines[-1][6])
-            now_ms = int(time.time() * 1000)
-            stale_minutes = (now_ms - latest_close_ms) / 60000
-            if stale_minutes > 90:
-                log(f"⚠️ Warning: Latest candle is {stale_minutes:.1f} minutes old — possible delay in data feed",
-                    telegram_bot, telegram_chat_id)
-            
-            # === ALIGN TO NEW CANDLE CLOSE ===
-            if bot_state.last_processed_close_ms is not None and latest_close_ms <= bot_state.last_processed_close_ms:
-                wait_sec = max(1.0, (latest_close_ms + interval_ms(timeframe) - int(time.time() * 1000)) / 1000.0 + 2)
-                next_dt = datetime.fromtimestamp((latest_close_ms + interval_ms(timeframe)) / 1000, tz=timezone.utc)
-                log(f"Waiting for next {timeframe} candle close in {wait_sec:.1f}s → {next_dt.strftime('%H:%M')} UTC",
-                    telegram_bot, telegram_chat_id)
-                _safe_sleep(wait_sec)
-                continue
-            
-            bot_state.last_processed_close_ms = latest_close_ms
-            
-            # Heartbeat
-            try:
-                now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-                price_now = Decimal("0")
-                pos_status = "Flat"
-                try:
-                    ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
-                    price_now = Decimal(str(ticker.get("price", "0")))
-                except:
-                    price_now = close_price if 'close_price' in dir() else Decimal("0")
-                
-                if trade_state.active:
-                    pos_status = f"Active MAIN @ {trade_state.entry_price:.4f}"
-                if bot_state.INSURANCE_ACTIVE and bot_state.insurance_trade:
-                    pos_status += f" | INSURANCE @ {bot_state.insurance_trade.entry_price:.4f}"
-                
-                mem_str = "N/A"
-                try:
-                    import psutil
-                    mem_str = f"{psutil.Process().memory_info().rss / 1024**2:.0f} MB"
-                except:
-                    pass
-                
-                heartbeat_msg = (
-                    f"[HEARTBEAT {now_str}] {timeframe} cycle done | "
-                    f"Price: {price_now:.2f} | "
-                    f"Pos: {pos_status} | "
-                    f"Mem: {mem_str}"
-                )
-                log(heartbeat_msg, telegram_bot, telegram_chat_id)
-            except Exception as e:
-                log(f"Heartbeat failed: {str(e)}", telegram_bot, telegram_chat_id)
-            
-            dt = datetime.fromtimestamp(latest_close_ms / 1000, tz=timezone.utc)
-            log(f"Aligned to {timeframe} candle close: {dt.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
-          
+
+            # === CANDLE DATA ===
             close_price = Decimal(str(klines[-1][4]))
             open_price = Decimal(str(klines[-1][1]))
             curr_vol = Decimal(str(klines[-1][5]))
             is_green_candle = close_price > open_price
             closes, volumes, _, _ = closes_and_volumes_from_klines(klines)
-            
+           
             rsi = compute_rsi(closes)
             vol_sma15 = sma(volumes, VOL_SMA_PERIOD) if len(volumes) >= VOL_SMA_PERIOD else None
-            
-            rsi_str = f"{rsi:.2f}" if rsi else "None"
-            vol_sma15_str = f"{vol_sma15:.2f}" if vol_sma15 else "None"
-            state = f"{close_price:.4f}|{rsi_str}|{curr_vol:.0f}|{vol_sma15_str}|{'G' if is_green_candle else 'R'}"
-            
-            if bot_state.last_candle_state is None or state != bot_state.last_candle_state:
-                rsi_display = f"{rsi:.2f}" if rsi else "N/A"
-                vol_sma15_display = f"{vol_sma15:.2f}" if vol_sma15 else "N/A"
-                log(f"Candle: {close_price:.4f} RSI={rsi_display} Vol={curr_vol:.0f} SMA15={vol_sma15_display} {'Green' if is_green_candle else 'Red'}", telegram_bot, telegram_chat_id)
-                bot_state.last_candle_state = state
-            
-            # === SIGNAL GENERATION ===
-            buy_signal = (rsi and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and (not use_volume_filter or (vol_sma15 and curr_vol > vol_sma15)))
-            sell_signal = (rsi and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and not is_green_candle and (not use_volume_filter or (vol_sma15 and curr_vol > vol_sma15)))
-            
-            if (buy_signal or sell_signal) and not pending_entry:
+           
+            rsi_str = f"{rsi:.2f}" if rsi else "N/A"
+            vol_sma15_str = f"{vol_sma15:.2f}" if vol_sma15 else "N/A"
+
+            # === CANDLE LOG: ONLY WHEN FLAT + NEW CANDLE ===
+            if current_state == "FLAT" and latest_close_ms != last_candle_logged_ms:
+                log(f"Candle: {close_price:.4f} RSI={rsi_str} Vol={curr_vol:.0f} SMA15={vol_sma15_str} {'Green' if is_green_candle else 'Red'}",
+                    telegram_bot, telegram_chat_id)
+                last_candle_logged_ms = latest_close_ms
+
+            # === DURING ACTIVE TRADE → STAY SILENT ===
+            if current_state == "ACTIVE":
+                wait_sec = max(2.0, (latest_close_ms + interval_ms(timeframe) - int(time.time() * 1000)) / 1000.0 + 2)
+                _safe_sleep(wait_sec)
+                continue
+
+            # === ONLY WHEN FLAT: Check for new candle ===
+            if bot_state.last_processed_close_ms is not None and latest_close_ms <= bot_state.last_processed_close_ms:
+                wait_sec = max(1.0, (latest_close_ms + interval_ms(timeframe) - int(time.time() * 1000)) / 1000.0 + 2)
+                next_dt = datetime.fromtimestamp((latest_close_ms + interval_ms(timeframe)) / 1000, tz=timezone.utc)
+                log(f"Waiting for next {timeframe} candle → {next_dt.strftime('%H:%M')} UTC",
+                    telegram_bot, telegram_chat_id)
+                _safe_sleep(wait_sec)
+                continue
+
+            bot_state.last_processed_close_ms = latest_close_ms
+
+            dt = datetime.fromtimestamp(latest_close_ms / 1000, tz=timezone.utc)
+            log(f"Aligned to {timeframe} candle close: {dt.strftime('%H:%M')} UTC — Checking signals",
+                telegram_bot, telegram_chat_id)
+
+            # ==================== SIGNAL LOGIC ====================
+            buy_signal = (rsi and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and
+                         (not use_volume_filter or (vol_sma15 and curr_vol > vol_sma15)))
+            sell_signal = (rsi and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and not is_green_candle and
+                          (not use_volume_filter or (vol_sma15 and curr_vol > vol_sma15)))
+
+            if buy_signal or sell_signal:
                 original_side = "BUY" if buy_signal else "SELL"
                 insurance_side = "SELL" if buy_signal else "BUY"
-                
-                log(f"📊 Signal detected: {original_side} (MAIN) / {insurance_side} (INSURANCE)", 
+               
+                log(f"📊 SIGNAL DETECTED → MAIN: {original_side} | INSURANCE: {insurance_side}",
                     telegram_bot, telegram_chat_id)
-                pending_entry = True
-                entry_price = close_price
-                
-                # === SLIPPAGE CHECK ===
-                slippage_passed, current_price_actual = _check_slippage(client, symbol, entry_price, telegram_bot, telegram_chat_id)
+
+                # SLIPPAGE CHECK
+                slippage_passed, _ = _check_slippage(client, symbol, close_price, telegram_bot, telegram_chat_id)
                 if not slippage_passed:
-                    log("Slippage check failed. Aborting both legs.", telegram_bot, telegram_chat_id)
-                    pending_entry = False
                     continue
-                
-                # === CALCULATE MAIN LEG QUANTITY (Virtual Split) ===
+
+                # === MAIN LEG ENTRY ===
+                entry_price = close_price
                 R_main = entry_price * SL_PCT
-                
-                # MAIN uses its own virtual capital (Bot A)
                 actual_balance = fetch_balance(client)
-                main_virtual_equity = actual_balance / 2
-                main_margin_available = main_virtual_equity * MARGIN_USAGE_PCT
-                main_risk_amount = main_virtual_equity * BASE_RISK_PCT
-                
-                # Raw quantity based on risk
-                qty_raw = main_risk_amount / R_main
-                
-                # Cap by available margin
-                max_qty_by_margin = (main_margin_available * MAX_LEVERAGE) / entry_price
-                qty_main = min(qty_raw, max_qty_by_margin)
-                # qty_main = qty_main * SAFETY_FACTOR  # 50% safety factor as requested
-                qty_main = min(qty_main, Decimal("25"))
+
+                main_virtual = actual_balance / Decimal("2")
+                main_margin = main_virtual * MARGIN_USAGE_PCT
+                main_risk = main_virtual * BASE_RISK_PCT
+
+                qty_raw = main_risk / R_main
+                max_by_margin = (main_margin * MAX_LEVERAGE) / entry_price
+                qty_main = min(qty_raw, max_by_margin, Decimal("25"))
                 qty_main = quantize_qty(qty_main, step_size)
-                
-                log(f"MAIN: Virtual=${main_virtual_equity:.2f} | Margin=${main_margin_available:.2f} | Risk=${main_risk_amount:.2f} | Qty={qty_main:.5f}",
-                    telegram_bot, telegram_chat_id)
-                
-                # MIN_NOTIONAL check
+
                 if (qty_main * entry_price) < min_notional:
-                    log(f"Main leg quantity too small → SKIP (Notional: {qty_main * entry_price:.2f} < Min: {min_notional:.2f})", 
-                        telegram_bot, telegram_chat_id)
-                    pending_entry = False
+                    log("Main leg quantity too small → skipping", telegram_bot, telegram_chat_id)
                     continue
-                
-                # === PLACE MAIN MARKET ORDER with positionSide ===
-                log(f"Placing MAIN {original_side} order: qty={qty_main}", telegram_bot, telegram_chat_id)
+
                 main_position_side = "LONG" if original_side == "BUY" else "SHORT"
                 order_res_main = client.send_signed_request("POST", "/fapi/v1/order", {
-                    "symbol": symbol, "side": original_side, "type": "MARKET", "quantity": str(qty_main),
-                    "positionSide": main_position_side
+                    "symbol": symbol, "side": original_side, "type": "MARKET",
+                    "quantity": str(qty_main), "positionSide": main_position_side
                 })
-                
+
                 # Wait for main fill
-                                # Wait for main fill with better detection
                 start_time = time.time()
                 actual_qty_main = None
-                
-                # Try up to 60 seconds (ORDER_FILL_TIMEOUT should be 60)
                 while not bot_state.STOP_REQUESTED and (time.time() - start_time) < ORDER_FILL_TIMEOUT:
                     pos_amt = get_position_amt_for_side(client, symbol, main_position_side)
                     if pos_amt > Decimal('0.001'):
                         actual_qty_main = pos_amt
-                        log(f"✅ Main fill detected! Qty: {actual_qty_main:.5f} SOL", 
-                            telegram_bot, telegram_chat_id)
+                        log(f"✅ Main fill detected! Qty: {actual_qty_main:.5f} SOL", telegram_bot, telegram_chat_id)
                         break
-                    time.sleep(1)  # Check every second (was 0.5)
-                
-                # If position detection failed, check order status directly
+                    time.sleep(1)
+
                 if actual_qty_main is None:
                     try:
                         order_status = client.send_signed_request("GET", "/fapi/v1/order", {
-                            "symbol": symbol,
-                            "orderId": order_res_main.get("orderId")
+                            "symbol": symbol, "orderId": order_res_main.get("orderId")
                         })
                         if order_status.get("status") == "FILLED":
                             actual_qty_main = Decimal(str(order_status.get("executedQty", "0")))
-                            log(f"✅ Main fill detected via order status! Qty: {actual_qty_main:.5f} SOL",
-                                telegram_bot, telegram_chat_id)
+                            log(f"✅ Main fill detected via order status! Qty: {actual_qty_main:.5f} SOL", telegram_bot, telegram_chat_id)
                     except Exception as e:
                         log(f"Order status check failed: {e}", telegram_bot, telegram_chat_id)
-                
+
                 if actual_qty_main is None or actual_qty_main <= Decimal('0'):
                     log("❌ Main leg fill failed. Aborting trade.", telegram_bot, telegram_chat_id)
-                    pending_entry = False
                     continue
-                
-                # Get actual fill price
-                actual_fill_price = client.get_latest_fill_price(symbol, order_res_main.get("orderId"))
-                if actual_fill_price is None:
-                    actual_fill_price = entry_price
-                
-                actual_fill_price_dec = actual_fill_price
-                
-                # === CREATE MAIN TRADE STATE ===
+
+                actual_fill_price_dec = client.get_latest_fill_price(symbol, order_res_main.get("orderId")) or entry_price
+
+                # === CREATE & ACTIVATE MAIN TRADE STATE ===
                 main_trade_state = TradeState()
                 main_trade_state.active = True
                 main_trade_state.leg_type = "MAIN"
@@ -2477,8 +2481,8 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 main_trade_state.entry_close_time = latest_close_ms
                 main_trade_state.risk = actual_fill_price_dec * SL_PCT
                 main_trade_state.trail_activated = False
-                
-                # Calculate main leg levels
+
+                # Calculate levels
                 R_main = actual_fill_price_dec * SL_PCT
                 if main_trade_state.side == "LONG":
                     sl_price_dec = actual_fill_price_dec * (Decimal("1") - SL_PCT)
@@ -2492,132 +2496,134 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                     trail_raw = actual_fill_price_dec - (TRAIL_TRIGGER_MULT * R_main)
                     trail_buffered = trail_raw - TRAIL_PRICE_BUFFER
                     trail_activation_quant = quantize_price(trail_buffered, tick_size, ROUND_DOWN)
-                
+
                 main_trade_state.sl = quantize_price(sl_price_dec, tick_size, ROUND_DOWN if main_trade_state.side == "LONG" else ROUND_UP)
                 main_trade_state.tp = quantize_price(tp_price_dec, tick_size, ROUND_UP if main_trade_state.side == "LONG" else ROUND_DOWN)
                 main_trade_state.trail_activation_price = trail_activation_quant
-                
-                # Send main leg Telegram
-                tg_msg_main = (
-                    f"📈 MAIN LEG ENTRY\n"
-                    f"━━━━━━━━━━━━━━━━\n"
-                    f"{main_trade_state.side} {symbol}\n"
-                    f"Entry: {actual_fill_price_dec:.4f}\n"
-                    f"Qty: {actual_qty_main:.5f} SOL\n"
-                    f"SL: {main_trade_state.sl:.4f}\n"
-                    f"TP: {main_trade_state.tp:.4f} ({TP_MULT:.2f}R)\n"
-                    f"Virtual Capital: ${MAIN_VIRTUAL_CAPITAL}\n"
-                    f"Risk: {BASE_RISK_PCT:.1%} of virtual capital\n"
-                    f"Leverage: {MAX_LEVERAGE}x"
-                )
+
+                # Send Telegram & Place orders
+                tg_msg_main = f"📈 MAIN LEG ENTRY\n{symbol} {main_trade_state.side}\nEntry: {actual_fill_price_dec:.4f}\nQty: {actual_qty_main:.5f}\nSL: {main_trade_state.sl:.4f}\nTP: {main_trade_state.tp:.4f}"
                 telegram_post(telegram_bot, telegram_chat_id, tg_msg_main)
-                
-                # Place main protective orders
+
                 place_orders(client, symbol, main_trade_state, tick_size, telegram_bot, telegram_chat_id)
-                
-                # Store main trade state
-                trade_state = main_trade_state
                 bot_state.current_trade = main_trade_state
-                
-                # === INSURANCE LEG ENTRY (if enabled) ===
+
+                threading.Thread(
+                    target=monitor_trade,
+                    args=(client, symbol, main_trade_state, tick_size, telegram_bot, telegram_chat_id, latest_close_ms),
+                    daemon=True
+                ).start()
+
+                                # === INSURANCE LEG ===
                 if INSURANCE_ENABLED:
                     log(f"Waiting {INSURANCE_DELAY_MS}ms before insurance entry...", telegram_bot, telegram_chat_id)
                     time.sleep(INSURANCE_DELAY_MS / 1000.0)
                     
-                    # Insurance uses its own virtual capital (Bot B)
                     ins_virtual_equity = actual_balance / 2
                     ins_margin_available = ins_virtual_equity * MARGIN_USAGE_PCT
                     
-                    # Insurance quantity = MAIN quantity (full hedge)
                     qty_insurance = actual_qty_main
-                    
-                    # Verify insurance doesn't exceed its margin
                     max_qty_by_margin_ins = (ins_margin_available * MAX_LEVERAGE) / entry_price
                     if qty_insurance > max_qty_by_margin_ins:
-                        log(f"Insurance would exceed margin, reducing from {qty_insurance:.5f} to {max_qty_by_margin_ins:.5f} SOL",
-                            telegram_bot, telegram_chat_id)
                         qty_insurance = max_qty_by_margin_ins
                     
-                    # Apply safety factor (same as MAIN)
-                    # qty_insurance = qty_insurance * SAFETY_FACTOR
                     qty_insurance = min(qty_insurance, Decimal("25"))
-                    qty_insurance = quantize_qty(qty_insurance, step_size)
+                    qty_insurance = quantize_qty(qty_insurance * SAFETY_FACTOR, step_size)
                     
-                    log(f"INSURANCE: Virtual=${ins_virtual_equity:.2f} | Margin=${ins_margin_available:.2f} | Qty={qty_insurance:.5f} SOL",
+                    log(f"INSURANCE: Virtual=${ins_virtual_equity:.2f} | Margin=${ins_margin_available:.2f} | Calculated Qty={qty_insurance:.5f} SOL",
                         telegram_bot, telegram_chat_id)
                     
                     if (qty_insurance * entry_price) < min_notional:
-                        log(f"Insurance leg quantity too small → SKIPPING INSURANCE (Notional: {qty_insurance * entry_price:.2f} < Min: {min_notional:.2f})", 
-                            telegram_bot, telegram_chat_id)
+                        log(f"Insurance leg quantity too small → SKIPPING INSURANCE", telegram_bot, telegram_chat_id)
                     else:
-                        # Determine insurance side (opposite of main)
                         insurance_side = "SELL" if original_side == "BUY" else "BUY"
                         insurance_position_side = "SHORT" if original_side == "BUY" else "LONG"
                         
-                        # Place insurance market order with positionSide
-                        log(f"Placing INSURANCE {insurance_side} order: qty={qty_insurance}", telegram_bot, telegram_chat_id)
+                        log(f"[DEBUG] Placing INSURANCE {insurance_side} order | positionSide={insurance_position_side} | qty={qty_insurance:.5f}", 
+                            telegram_bot, telegram_chat_id)
+                        
+                        # Place the order
                         order_res_insurance = client.send_signed_request("POST", "/fapi/v1/order", {
-                            "symbol": symbol, "side": insurance_side, "type": "MARKET", "quantity": str(qty_insurance),
+                            "symbol": symbol, 
+                            "side": insurance_side, 
+                            "type": "MARKET", 
+                            "quantity": str(qty_insurance),
                             "positionSide": insurance_position_side
                         })
                         
-                        # CREATE insurance_trade_state ONCE before fill detection
-                        insurance_trade_state = TradeState()
-                        insurance_trade_state.leg_type = "INSURANCE"
-                        insurance_trade_state.side = "LONG" if insurance_side == "BUY" else "SHORT"
-                        
-                        # Wait for insurance fill with better detection
+                        insurance_order_id = order_res_insurance.get("orderId")
+                        log(f"[DEBUG] Insurance order placed. orderId={insurance_order_id}", telegram_bot, telegram_chat_id)
+
+                        # === IMPROVED + HEAVY DEBUG FILL DETECTION ===
                         start_time_ins = time.time()
                         actual_qty_insurance = None
-                        pos_amt_before = get_position_amt_for_side(client, symbol, insurance_position_side)
+                        max_wait = 120  # 2 minutes
                         
-                        # Try up to 60 seconds
-                        while not bot_state.STOP_REQUESTED and (time.time() - start_time_ins) < 60:
-                            pos_amt = get_position_amt_for_side(client, symbol, insurance_position_side)
-                            if pos_amt - pos_amt_before > Decimal('0.001'):
-                                actual_qty_insurance = pos_amt - pos_amt_before
-                                log(f"✅ Insurance fill detected! Qty: {actual_qty_insurance:.5f} SOL", 
+                        log(f"[DEBUG] Starting insurance fill detection. Max wait: {max_wait}s | Querying positionSide={insurance_position_side}", 
+                            telegram_bot, telegram_chat_id)
+                        
+                        pos_amt_before = get_position_amt_for_side(client, symbol, insurance_position_side)
+                        log(f"[DEBUG] Position before insurance: {pos_amt_before:.5f}", telegram_bot, telegram_chat_id)
+                        
+                        while not bot_state.STOP_REQUESTED and (time.time() - start_time_ins) < max_wait:
+                            pos_amt_now = get_position_amt_for_side(client, symbol, insurance_position_side)
+                            delta = pos_amt_now - pos_amt_before
+                            
+                            log(f"[DEBUG] Check | Now={pos_amt_now:.5f} | Delta={delta:.5f} | Time elapsed={(time.time()-start_time_ins):.1f}s", 
+                                telegram_bot, telegram_chat_id)
+                            
+                            if delta > Decimal('0.0002'):          # Very forgiving threshold
+                                actual_qty_insurance = pos_amt_now
+                                log(f"✅ Insurance fill detected via position! Qty={actual_qty_insurance:.5f} SOL", 
                                     telegram_bot, telegram_chat_id)
                                 break
-                            time.sleep(1)  # Check every second
+                            
+                            # Extra check via order status
+                            if insurance_order_id:
+                                try:
+                                    order_status = client.send_signed_request("GET", "/fapi/v1/order", {
+                                        "symbol": symbol, 
+                                        "orderId": insurance_order_id
+                                    })
+                                    status = order_status.get("status")
+                                    executed = Decimal(str(order_status.get("executedQty", "0")))
+                                    log(f"[DEBUG] Order status: {status} | Executed Qty={executed:.5f}", telegram_bot, telegram_chat_id)
+                                    
+                                    if status == "FILLED" and executed > Decimal('0.0001'):
+                                        actual_qty_insurance = executed
+                                        log(f"✅ Insurance fill confirmed via order status! Qty={actual_qty_insurance:.5f}", 
+                                            telegram_bot, telegram_chat_id)
+                                        break
+                                except Exception as e:
+                                    log(f"[DEBUG] Order status check failed: {e}", telegram_bot, telegram_chat_id)
+                            
+                            time.sleep(1.8)   # Balanced sleep
                         
-                        if actual_qty_insurance is None:
-                            # Check order status directly as fallback
-                            try:
-                                order_status = client.send_signed_request("GET", "/fapi/v1/order", {
-                                    "symbol": symbol,
-                                    "orderId": order_res_insurance.get("orderId")
-                                })
-                                if order_status.get("status") == "FILLED":
-                                    actual_qty_insurance = Decimal(str(order_status.get("executedQty", "0")))
-                                    log(f"✅ Insurance fill detected via order status! Qty: {actual_qty_insurance:.5f} SOL",
-                                        telegram_bot, telegram_chat_id)
-                            except Exception as e:
-                                log(f"Order status check failed: {e}", telegram_bot, telegram_chat_id)
-                        
+                        # === FINAL RESULT ===
                         if actual_qty_insurance is None or actual_qty_insurance <= Decimal('0'):
-                            log("❌ Insurance leg fill failed. Continuing with main leg only.", telegram_bot, telegram_chat_id)
+                            log("❌ Insurance leg fill failed after 120s. Continuing with main leg only.", 
+                                telegram_bot, telegram_chat_id)
+                            log(f"[DEBUG] Final position on {insurance_position_side}: {get_position_amt_for_side(client, symbol, insurance_position_side):.5f}", 
+                                telegram_bot, telegram_chat_id)
                         else:
-                            # Update insurance trade state with actual filled quantity and entry price
+                            # === Create insurance trade state ===
+                            insurance_trade_state = TradeState()
                             insurance_trade_state.active = True
+                            insurance_trade_state.leg_type = "INSURANCE"
+                            insurance_trade_state.side = "LONG" if insurance_side == "BUY" else "SHORT"
                             insurance_trade_state.entry_price = actual_fill_price_dec
                             insurance_trade_state.qty = actual_qty_insurance
                             insurance_trade_state.entry_close_time = latest_close_ms
                             insurance_trade_state.risk = actual_fill_price_dec * SL_PCT
                             insurance_trade_state.trail_activated = False
                             
-                            # Calculate R
                             R = actual_fill_price_dec * SL_PCT
-                            
-                            # Calculate insurance SL and TP based on MAIN direction
-                            if original_side == "BUY":  # MAIN LONG → insurance SHORT
-                                # For SHORT: SL above entry, TP below entry
+                            if original_side == "BUY":
                                 sl_price_dec = actual_fill_price_dec + R
                                 tp_price_dec = actual_fill_price_dec - (R * Decimal("1.25"))
                                 sl_rounding = ROUND_UP
                                 tp_rounding = ROUND_DOWN
-                            else:  # MAIN SHORT → insurance LONG
-                                # For LONG: SL below entry, TP above entry
+                            else:
                                 sl_price_dec = actual_fill_price_dec - R
                                 tp_price_dec = actual_fill_price_dec + (R * Decimal("1.25"))
                                 sl_rounding = ROUND_DOWN
@@ -2627,7 +2633,6 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                             insurance_trade_state.tp = quantize_price(tp_price_dec, tick_size, tp_rounding)
                             insurance_trade_state.trail_activation_price = None
                             
-                            # Send insurance leg Telegram
                             tg_msg_insurance = (
                                 f"🛡️ INSURANCE LEG ENTRY\n"
                                 f"━━━━━━━━━━━━━━━━\n"
@@ -2641,80 +2646,35 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                             )
                             telegram_post(telegram_bot, telegram_chat_id, tg_msg_insurance)
                             
-                            # Place insurance protective orders
-                            log("🛡️ Placing insurance protective orders...", telegram_bot, telegram_chat_id)
                             place_orders(client, symbol, insurance_trade_state, tick_size, telegram_bot, telegram_chat_id)
                             
-                            # Store insurance trade state
                             bot_state.insurance_trade = insurance_trade_state
                             bot_state.INSURANCE_ACTIVE = True
                             
-                            # Start monitoring insurance leg
                             threading.Thread(
                                 target=monitor_trade,
                                 args=(client, symbol, insurance_trade_state, tick_size, 
                                       telegram_bot, telegram_chat_id, latest_close_ms),
                                 daemon=True
                             ).start()
-                            log(f"Insurance leg monitoring started", telegram_bot, telegram_chat_id)
+                            log(f"✅ Insurance leg monitoring started", telegram_bot, telegram_chat_id)
                 
                 trades_today += 1
-                pending_entry = False
-                
-                # Start monitoring main leg
-                monitor_trade(client, symbol, main_trade_state, tick_size, telegram_bot, telegram_chat_id, latest_close_ms)
                 continue
+
             else:
-                if not pending_entry:
-                    log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
-            
-            # === PERFECT 45m WAIT — BINANCE SERVER TIME ALIGNED ===
-            if timeframe == "45m":
-                try:
-                    server_time = int(client.public_request("/fapi/v1/time")["serverTime"])
-                except Exception as e:
-                    log(f"Failed to fetch server time: {e}", telegram_bot, telegram_chat_id)
-                    server_time = int(time.time() * 1000)
-                interval = interval_ms(timeframe)
-                next_close_ms = ((server_time // interval) * interval) + interval
-            else:
-                try:
-                    server_time = int(client.public_request("/fapi/v1/time")["serverTime"])
-                except Exception as e:
-                    log(f"Failed to fetch server time: {e}", telegram_bot, telegram_chat_id)
-                    server_time = int(time.time() * 1000)
-                interval = interval_ms(timeframe)
-                next_close_ms = ((server_time // interval) * interval) + interval
-            
-            now_ms = int(time.time() * 1000)
-            wait_sec = max(2.0, (next_close_ms - now_ms) / 1000.0 + 2.0)
-            next_dt_log = datetime.fromtimestamp(next_close_ms / 1000, tz=timezone.utc)
-            log(
-                f"Waiting for next {timeframe} candle close in {wait_sec:.1f}s → "
-                f"{next_dt_log.strftime('%H:%M')} UTC",
-                telegram_bot,
-                telegram_chat_id
-            )
+                log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
+
+            # === WAIT FOR NEXT CANDLE WHEN FLAT ===
+            wait_sec = max(2.0, (latest_close_ms + interval_ms(timeframe) - int(time.time() * 1000)) / 1000.0 + 2)
             _safe_sleep(wait_sec)
-        
+
         except Exception as e:
             import traceback
-            error_msg = f"Loop error: {str(e)}"
-            full_trace = traceback.format_exc()
-          
-            logger.error(error_msg)
-            logger.error(full_trace)
-          
-            try:
-                telegram_post(telegram_bot, telegram_chat_id, f"⚠️ BOT ERROR ⚠️\n{error_msg}")
-            except NameError:
-                pass
-            except Exception as e2:
-                logger.error(f"Telegram error during exception handling: {e2}")
-          
-            time.sleep(2)
-    
-    log("Trading loop exited.", telegram_bot, telegram_chat_id)
+            log(f"Trading loop error: {str(e)}", telegram_bot, telegram_chat_id)
+            time.sleep(5)
+
+    log("Trading loop exited cleanly.", telegram_bot, telegram_chat_id)
 
 def interval_ms(interval: str) -> int:
     interval = interval.strip().lower()
@@ -2911,7 +2871,7 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
 
 # ==================== TELEGRAM COMMAND HANDLERS ====================
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Telegram /restart - safely restarts bot, preserves positions"""
+    """Telegram /restart - safely restarts bot while preserving positions"""
     global bot_state, args, LOCK_HANDLE
     
     chat_id = str(update.effective_chat.id)
@@ -2920,54 +2880,52 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Unauthorized.")
         return
     
+    # Check current positions for user message
     has_position = False
     position_details = ""
+    
     if (bot_state.client and bot_state.current_trade and 
         bot_state.current_trade.active and bot_state.current_trade.qty):
         has_position = True
         position_details = (f"MAIN: {bot_state.current_trade.side} "
-                           f"{bot_state.current_trade.qty} SOL "
-                           f"@ {bot_state.current_trade.entry_price:.2f}")
+                           f"{bot_state.current_trade.qty:.5f} SOL "
+                           f"@ {bot_state.current_trade.entry_price:.4f}")
     
     if bot_state.INSURANCE_ACTIVE and bot_state.insurance_trade and bot_state.insurance_trade.qty:
         has_position = True
         position_details += (f"\nINSURANCE: {bot_state.insurance_trade.side} "
-                            f"{bot_state.insurance_trade.qty} SOL "
-                            f"@ {bot_state.insurance_trade.entry_price:.2f}")
-    
+                            f"{bot_state.insurance_trade.qty:.5f} SOL "
+                            f"@ {bot_state.insurance_trade.entry_price:.4f}")
+
     if has_position:
         await update.message.reply_text(
             f"🔄 *Restarting with ACTIVE POSITIONS*\n\n"
             f"📊 *Positions:*\n{position_details}\n\n"
-            f"🛡️ *SL/TP orders stay on Binance*\n"
-            f"🤖 Bot will resume monitoring after restart\n\n"
+            f"🛡️ *SL/TP/Trailing orders will stay on Binance*\n"
+            f"🤖 Bot will re-attach monitoring after restart\n\n"
             f"Restarting in 2 seconds...",
             parse_mode='Markdown'
         )
     else:
         await update.message.reply_text("🔄 Restarting bot now...")
-    
+
     try:
         save_bot_state()
-        await update.message.reply_text("💾 Trade history saved")
-    except:
-        await update.message.reply_text("⚠️ Save warning - restarting anyway")
-    
-    log("🔧 Manual restart via Telegram", args.telegram_token, args.chat_id)
-    
-    await asyncio.sleep(2)
-    
-    try:
-        if LOCK_HANDLE:
-            LOCK_HANDLE.close()
-            print("Lock handle closed successfully for restart")
+        await update.message.reply_text("💾 Trade history & state saved")
     except Exception as e:
-        print(f"Error closing lock handle during restart: {e}")
-    
-    time.sleep(1)
-    
-    import os, sys
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+        await update.message.reply_text(f"⚠️ Save warning: {str(e)[:100]}")
+
+    log("🔧 Manual restart requested via Telegram", args.telegram_token, args.chat_id)
+
+    await asyncio.sleep(2)
+
+    # Use graceful_shutdown with restart mode = True
+    graceful_shutdown(
+        symbol=args.symbol,
+        telegram_bot=args.telegram_token,
+        telegram_chat_id=args.chat_id,
+        is_restart=True
+    )
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command: /status — quick bot health check"""
@@ -3085,24 +3043,24 @@ if __name__ == "__main__":
     bot_state.weekly_peak_equity = None
     bot_state.weekly_dd_alert_triggered = False
     log("⚠️ WEEKLY DRAWDOWN GUARD RESET - TRADING ENABLED", args.telegram_token, args.chat_id)
-# ===========================================
-    # ======================== SINGLE, BULLETPROOF SHUTDOWN ========================
+    # ======================== SAFE RESTART & SHUTDOWN ========================
     _shutdown_done = False
-    
+
     def graceful_shutdown(sig: Optional[int] = None, frame: Any = None, 
                           symbol: Optional[str] = None, 
                           telegram_bot: Optional[str] = None, 
-                          telegram_chat_id: Optional[str] = None):
+                          telegram_chat_id: Optional[str] = None,
+                          is_restart: bool = False):
         global _shutdown_done, bot_state, args, LOCK_HANDLE
         
-        symbol = symbol or args.symbol
-        telegram_bot = telegram_bot or args.telegram_token
-        telegram_chat_id = telegram_chat_id or args.chat_id
+        symbol = symbol or getattr(args, 'symbol', None)
+        telegram_bot = telegram_bot or getattr(args, 'telegram_token', None)
+        telegram_chat_id = telegram_chat_id or getattr(args, 'chat_id', None)
         
         if _shutdown_done:
             return
         _shutdown_done = True
-        
+
         reason = {
             signal.SIGINT: "Ctrl+C",
             signal.SIGTERM: "SIGTERM / systemd",
@@ -3110,76 +3068,90 @@ if __name__ == "__main__":
         
         if os.path.exists("/tmp/STOP_BOT_NOW"):
             reason = "KILL FLAG / Manual stop"
-        
-        log(f"🛑 Shutdown requested ({reason}). Cleaning up...", telegram_bot, telegram_chat_id)
-        
-        save_bot_state()
-        
-        has_active_position = False
-        pos_amt = Decimal('0')
-        
-        if bot_state.client and symbol:
-            try:
-                pos_amt = get_position_amt(bot_state.client, symbol, telegram_bot, telegram_chat_id)
-                has_active_position = pos_amt != Decimal('0')
-            except:
-                pass
-        
-        if has_active_position:
-            log("🔄 RESTARTING WITH ACTIVE POSITIONS - PRESERVING POSITIONS", telegram_bot, telegram_chat_id)
-            log(f"✅ Net Position: {abs(float(pos_amt)):.2f} SOL remains open - orders stay on Binance", telegram_bot, telegram_chat_id)
-        else:
-            log("Normal shutdown - cleaning up orders", telegram_bot, telegram_chat_id)
+
+        log(f"🛑 Shutdown requested ({reason}) | Restart mode: {is_restart}", telegram_bot, telegram_chat_id)
+
+        # Save state
+        try:
+            save_bot_state()
+        except Exception as e:
+            log(f"Warning: Failed to save state: {e}", telegram_bot, telegram_chat_id)
+
+        # === IMPORTANT: On normal stop → close positions. On restart → preserve ===
+        if not is_restart:
+            log("Normal shutdown → Closing all positions...", telegram_bot, telegram_chat_id)
             if bot_state.client and symbol:
                 try:
-                    bot_state.client.cancel_all_open_orders(symbol)
+                    _request_stop(symbol=symbol, telegram_bot=telegram_bot, telegram_chat_id=telegram_chat_id)
                 except Exception as e:
-                    log(f"Order cleanup error: {e}", telegram_bot, telegram_chat_id)
-        
+                    log(f"Error closing positions: {e}", telegram_bot, telegram_chat_id)
+        else:
+            log("🔄 RESTART mode → PRESERVING active positions and orders on Binance", telegram_bot, telegram_chat_id)
+            # Do NOT call _request_stop — just let positions stay open
+
+        # Final order cleanup only on full stop
+        if not is_restart:
+            try:
+                if bot_state.client and symbol:
+                    bot_state.client.cancel_all_open_orders(symbol)
+            except:
+                pass
+
+        # Clear local state
+        bot_state.current_trade = None
+        bot_state.insurance_trade = None
+        bot_state.INSURANCE_ACTIVE = False
+
         goodbye = (
-            f"RSI BOT STOPPED\n"
+            f"✅ RSI BOT {'RESTARTING' if is_restart else 'STOPPED'}\n"
             f"Symbol: {symbol}\n"
-            f"Timeframe: {args.timeframe}\n"
+            f"Timeframe: {getattr(args, 'timeframe', 'N/A')}\n"
             f"Reason: {reason}\n"
             f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
             f"Insurance: {'ENABLED' if INSURANCE_ENABLED else 'DISABLED'}"
         )
         
-        if has_active_position:
-            goodbye += "\n✅ POSITIONS PRESERVED - Orders remain active"
-        
+        if is_restart:
+            goodbye += "\n🔄 Positions preserved on Binance - bot will re-attach after restart"
+
         try:
             log(goodbye, telegram_bot, telegram_chat_id)
-        except Exception as e:
-            print(f"Error during goodbye log: {e}")
-        
-        if sig is not None:
-            try:
-                if LOCK_HANDLE:
-                    try:
-                        LOCK_HANDLE.close()
-                    except:
-                        pass
-                if os.path.exists(LOCK_FILE):
-                    os.unlink(LOCK_FILE)
-                    log(f"Lock file removed: {LOCK_FILE}", telegram_bot, telegram_chat_id)
-            except Exception as e:
-                print(f"Error cleaning lock file: {e}")
-        
+        except:
+            pass
+
+        # Clean lock
         try:
-            if os.path.exists("/tmp/STOP_BOT_NOW"):
+            if LOCK_HANDLE:
+                LOCK_HANDLE.close()
+            if os.path.exists(LOCK_FILE):
+                os.unlink(LOCK_FILE)
+        except:
+            pass
+
+        if os.path.exists("/tmp/STOP_BOT_NOW"):
+            try:
                 os.unlink("/tmp/STOP_BOT_NOW")
-        except Exception as e:
-            print(f"Error removing kill flag: {e}")
+            except:
+                pass
+
+        log(f"Bot {'restarting' if is_restart else 'shutting down'}...", telegram_bot, telegram_chat_id)
         
-        os._exit(0)
-        
+        if is_restart:
+            # Real restart
+            time.sleep(2)
+            import os, sys
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        else:
+            os._exit(0)
+
+
     def signal_handler_wrapper(sig, frame):
-        graceful_shutdown(sig, frame, args.symbol, args.telegram_token, args.chat_id)
+        graceful_shutdown(sig, frame, args.symbol, args.telegram_token, args.chat_id, is_restart=False)
     
+    # Register signals
     signal.signal(signal.SIGINT, signal_handler_wrapper)
     signal.signal(signal.SIGTERM, signal_handler_wrapper)
-    atexit.register(lambda: graceful_shutdown(None, None, args.symbol, args.telegram_token, args.chat_id))
+    atexit.register(lambda: graceful_shutdown(None, None, args.symbol, args.telegram_token, args.chat_id, is_restart=False))
     
     # ======================== IMMORTAL BOT LOOP ========================
     while True:
