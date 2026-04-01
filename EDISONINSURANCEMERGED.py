@@ -106,7 +106,7 @@ NEWS_GUARD_ENABLED = True  # ← Will be overridden by --no-news-guard
 MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'edison_insurance_bot.lock')
 BASE_RISK_PCT = Decimal("0.068")  # 6.8% when drawdown = 0%
-MAX_LEVERAGE = Decimal("9")        # MAIN LEG leverage
+MAX_LEVERAGE = Decimal("5")        # MAIN LEG leverage
 
 # === WEEKLY SCALING QUICK TOGGLE ===
 ENABLE_WEEKLY_SCALING = True  # ← Set to False to disable scaling completely
