@@ -66,7 +66,7 @@ SAFETY_FACTOR = Decimal("0.90")      # 50% safety factor (as requested)
 # Virtual split configuration (emulating two separate accounts)
 MAIN_VIRTUAL_CAPITAL = Decimal("250")      # $250 virtual capital for MAIN
 INSURANCE_VIRTUAL_CAPITAL = Decimal("250") # $250 virtual capital for INSURANCE
-MARGIN_USAGE_PCT = Decimal("0.75")         # Use 75% of virtual capital ($187.50 each)
+MARGIN_USAGE_PCT = Decimal("0.83")         # Use 75% of virtual capital ($187.50 each)
 # ========================================================================
 
 # For recovery only (insurance TP/SL are normally set in trading loop)
