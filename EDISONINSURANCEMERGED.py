@@ -3197,7 +3197,7 @@ if __name__ == "__main__":
             bot_state.account_size = balance
             bot_state.daily_start_equity = balance
           
-            leverage_to_set = 9
+            leverage_to_set = 5
             bot_state.client.set_leverage(args.symbol, leverage_to_set)
             log(f"Set Binance leverage to {leverage_to_set}x for {args.symbol}", args.telegram_token, args.chat_id)
             
