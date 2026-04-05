@@ -71,7 +71,7 @@ MARGIN_USAGE_PCT = Decimal("0.83")         # Use 75% of virtual capital ($187.50
 
 # For recovery only (insurance TP/SL are normally set in trading loop)
 INSURANCE_SL_MULT = Decimal("1.0")   # 1R SL
-INSURANCE_TP_MULT = Decimal("1.25")   # 1.25R TP
+INSURANCE_TP_MULT = Decimal("0.9")   # 1.25R TP
 
 # ---------------------------------------------------------------------------------------
 # === CONFIG: BLACKOUT WINDOWS (UTC) ===
