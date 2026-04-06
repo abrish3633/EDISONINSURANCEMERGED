@@ -106,7 +106,7 @@ NEWS_GUARD_ENABLED = True  # ← Will be overridden by --no-news-guard
 MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'edison_insurance_bot.lock')
 BASE_RISK_PCT = Decimal("0.068")  # 6.8% when drawdown = 0%
-MAX_LEVERAGE = Decimal("5")        # MAIN LEG leverage
+MAX_LEVERAGE = Decimal("9")        # MAIN LEG leverage
 
 # === WEEKLY SCALING QUICK TOGGLE ===
 ENABLE_WEEKLY_SCALING = True  # ← Set to False to disable scaling completely
@@ -2250,61 +2250,34 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                  telegram_chat_id: Optional[str]):
     global bot_state
 
-    # === STATE TRACKING FOR CLEAN LOGGING ===
-    last_position_state = "FLAT"
-    last_candle_logged_ms = None
-    last_trade_date = datetime.now(timezone.utc).date()
+    interval_seconds = interval_ms(timeframe) / 1000.0
     trades_today = 0
+    last_trade_date = datetime.now(timezone.utc).date()
     pending_entry = False
-    bot_state.max_trades_alert_sent = False
+    last_processed_time = 0
 
-    # Get symbol filters once (outside the loop)
+    # Get filters once
     filters = get_symbol_filters(client, symbol)
     step_size = filters['stepSize']
-    min_notional = filters['minNotional']
+    min_qty = filters['minQty']
     tick_size = filters['tickSize']
+    min_notional = filters['minNotional']
 
-    log(f"🚀 Trading loop started → {symbol} | {timeframe} | Insurance: {'ENABLED' if INSURANCE_ENABLED else 'DISABLED'}",
+    bot_state.max_trades_alert_sent = False
+
+    log(f"Bot started on {last_trade_date}. Trades today: {trades_today} | Insurance: {'ENABLED' if INSURANCE_ENABLED else 'DISABLED'}", 
+        telegram_bot, telegram_chat_id)
+    log(f"Starting bot with symbol={symbol}, timeframe={timeframe}, risk_pct={risk_pct*Decimal('100'):.1f}%", 
         telegram_bot, telegram_chat_id)
 
+    # === MAIN TRADING LOOP — EXACT STRUCTURE FROM EDISON DECIMAL ===
     while not bot_state.STOP_REQUESTED and not os.path.exists("stop.txt"):
         try:
-            # === CRITICAL SAFETY CLEANUP ===
-            any_leg_active = has_any_active_leg()
-
-            # Sync real Binance position with bot state
-            try:
-                long_amt = get_position_amt_for_side(client, symbol, "LONG")
-                short_amt = get_position_amt_for_side(client, symbol, "SHORT")
-                real_position = abs(long_amt) + abs(short_amt)
-
-                if real_position == Decimal('0') and any_leg_active:
-                    log("⚠️ State desync: Binance flat but bot shows active trade → Resetting state",
-                        telegram_bot, telegram_chat_id)
-                    bot_state.current_trade = None
-                    bot_state.insurance_trade = None
-                    bot_state.INSURANCE_ACTIVE = False
-                    any_leg_active = False
-            except Exception as e:
-                log(f"Position verification error: {e}", telegram_bot, telegram_chat_id)
-
-            # Clear stale objects
-            if bot_state.current_trade and not bot_state.current_trade.active:
-                bot_state.current_trade = None
-            if bot_state.insurance_trade and not bot_state.insurance_trade.active:
-                bot_state.insurance_trade = None
-                bot_state.INSURANCE_ACTIVE = False
-
-            any_leg_active = has_any_active_leg()
-            current_state = "ACTIVE" if any_leg_active else "FLAT"
-
-            # === STATE CHANGE LOGGING ===
-            if current_state != last_position_state:
-                if current_state == "ACTIVE":
-                    log("🚀 POSITION OPENED → Entering silent monitoring mode", telegram_bot, telegram_chat_id)
-                else:
-                    log("✅ POSITION CLOSED → Resuming signal scanning", telegram_bot, telegram_chat_id)
-                last_position_state = current_state
+            # === IF ANY LEG IS ACTIVE → STAY SILENT (just like Decimal) ===
+            if has_any_active_leg():
+                # Let the monitor threads handle everything
+                time.sleep(1)
+                continue
 
             # === DAILY RESET ===
             now_date = datetime.now(timezone.utc).date()
@@ -2314,7 +2287,7 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 trades_today = 0
                 bot_state.max_trades_alert_sent = False
                 daily_start_balance = fetch_balance(client)
-                log(f"NEW DAY → {old_date} → {now_date} | Trades reset | Equity: ${daily_start_balance:.2f}",
+                log(f"NEW DAY → {old_date} → {now_date} | Trades reset | Equity: ${daily_start_balance:.2f}", 
                     telegram_bot, telegram_chat_id)
 
             if trades_today >= max_trades_per_day:
@@ -2328,16 +2301,54 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 time.sleep(1)
                 continue
 
-            # === FETCH KLINES & VALIDATE ===
+            # === FETCH KLINES & VALIDATE QUALITY (Exact same as Decimal) ===
             klines = fetch_klines(client, symbol, timeframe)
             bot_state.is_testnet = True
             is_good, msg = ensure_tv_quality_data(klines, timeframe, is_testnet=bot_state.is_testnet)
             if not is_good:
-                log(f"Data quality failed: {msg}. Skipping cycle.", telegram_bot, telegram_chat_id)
+                log(f"Data quality failed: {msg}. Skipping this cycle.", telegram_bot, telegram_chat_id)
                 time.sleep(10)
                 continue
 
             latest_close_ms = int(klines[-1][6])
+            now_ms = int(time.time() * 1000)
+            stale_minutes = (now_ms - latest_close_ms) / 60000
+            if stale_minutes > 90:
+                log(f"⚠️ Warning: Latest candle is {stale_minutes:.1f} minutes old — possible delay", 
+                    telegram_bot, telegram_chat_id)
+
+            # === ALIGN TO NEW CANDLE CLOSE (Exact same logic as EDISON DECIMAL) ===
+            if bot_state.last_processed_close_ms is not None and latest_close_ms <= bot_state.last_processed_close_ms:
+                wait_sec = max(1.0, (latest_close_ms + interval_ms(timeframe) - now_ms) / 1000.0 + 2)
+                next_dt = datetime.fromtimestamp((latest_close_ms + interval_ms(timeframe)) / 1000, tz=timezone.utc)
+                log(f"Waiting for next {timeframe} candle close in {wait_sec:.1f}s → {next_dt.strftime('%H:%M')} UTC",
+                    telegram_bot, telegram_chat_id)
+                _safe_sleep(wait_sec)
+                continue
+
+            bot_state.last_processed_close_ms = latest_close_ms
+
+            # === HEARTBEAT (when flat) - Matches Decimal style ===
+            try:
+                now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+                price_now = Decimal("0")
+                try:
+                    ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                    price_now = Decimal(str(ticker.get("price", "0")))
+                except:
+                    price_now = Decimal(str(klines[-1][4]))
+
+                heartbeat_msg = (
+                    f"[HEARTBEAT {now_str}] {timeframe} cycle done | "
+                    f"Price: {price_now:.2f} | Pos: FLAT | "
+                    f"Mem: {psutil.Process().memory_info().rss / 1024**2:.0f} MB" if 'psutil' in globals() else "N/A"
+                )
+                log(heartbeat_msg, telegram_bot, telegram_chat_id)
+            except:
+                pass
+
+            dt = datetime.fromtimestamp(latest_close_ms / 1000, tz=timezone.utc)
+            log(f"Aligned to {timeframe} candle close: {dt.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
 
             # === CANDLE DATA ===
             close_price = Decimal(str(klines[-1][4]))
@@ -2345,39 +2356,21 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
             curr_vol = Decimal(str(klines[-1][5]))
             is_green_candle = close_price > open_price
             closes, volumes, _, _ = closes_and_volumes_from_klines(klines)
-           
+
             rsi = compute_rsi(closes)
             vol_sma15 = sma(volumes, VOL_SMA_PERIOD) if len(volumes) >= VOL_SMA_PERIOD else None
-           
-            rsi_str = f"{rsi:.2f}" if rsi else "N/A"
-            vol_sma15_str = f"{vol_sma15:.2f}" if vol_sma15 else "N/A"
 
-            # === CANDLE LOG: ONLY WHEN FLAT + NEW CANDLE ===
-            if current_state == "FLAT" and latest_close_ms != last_candle_logged_ms:
-                log(f"Candle: {close_price:.4f} RSI={rsi_str} Vol={curr_vol:.0f} SMA15={vol_sma15_str} {'Green' if is_green_candle else 'Red'}",
+            # === STATE STRING FOR DEDUPLICATION (Exact same as Decimal) ===
+            rsi_str = f"{rsi:.2f}" if rsi else "None"
+            vol_sma15_str = f"{vol_sma15:.2f}" if vol_sma15 else "None"
+            state = f"{close_price:.4f}|{rsi_str}|{curr_vol:.0f}|{vol_sma15_str}|{'G' if is_green_candle else 'R'}"
+
+            if bot_state.last_candle_state is None or state != bot_state.last_candle_state:
+                rsi_display = f"{rsi:.2f}" if rsi else "N/A"
+                vol_sma15_display = f"{vol_sma15:.2f}" if vol_sma15 else "N/A"
+                log(f"Candle: {close_price:.4f} RSI={rsi_display} Vol={curr_vol:.0f} SMA15={vol_sma15_display} {'Green' if is_green_candle else 'Red'}", 
                     telegram_bot, telegram_chat_id)
-                last_candle_logged_ms = latest_close_ms
-
-            # === DURING ACTIVE TRADE → STAY SILENT ===
-            if current_state == "ACTIVE":
-                wait_sec = max(2.0, (latest_close_ms + interval_ms(timeframe) - int(time.time() * 1000)) / 1000.0 + 2)
-                _safe_sleep(wait_sec)
-                continue
-
-            # === ONLY WHEN FLAT: Check for new candle ===
-            if bot_state.last_processed_close_ms is not None and latest_close_ms <= bot_state.last_processed_close_ms:
-                wait_sec = max(1.0, (latest_close_ms + interval_ms(timeframe) - int(time.time() * 1000)) / 1000.0 + 2)
-                next_dt = datetime.fromtimestamp((latest_close_ms + interval_ms(timeframe)) / 1000, tz=timezone.utc)
-                log(f"Waiting for next {timeframe} candle → {next_dt.strftime('%H:%M')} UTC",
-                    telegram_bot, telegram_chat_id)
-                _safe_sleep(wait_sec)
-                continue
-
-            bot_state.last_processed_close_ms = latest_close_ms
-
-            dt = datetime.fromtimestamp(latest_close_ms / 1000, tz=timezone.utc)
-            log(f"Aligned to {timeframe} candle close: {dt.strftime('%H:%M')} UTC — Checking signals",
-                telegram_bot, telegram_chat_id)
+                bot_state.last_candle_state = state
 
             # ==================== SIGNAL LOGIC ====================
             buy_signal = (rsi and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and
@@ -2690,21 +2683,41 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                                 telegram_bot, telegram_chat_id)
                 
                 trades_today += 1
-                continue
+                pending_entry = False
 
             else:
-                log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
+                if not pending_entry:
+                    log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
 
-            # === WAIT FOR NEXT CANDLE WHEN FLAT ===
-            wait_sec = max(2.0, (latest_close_ms + interval_ms(timeframe) - int(time.time() * 1000)) / 1000.0 + 2)
+            # === PERFECT 45m WAIT — EXACT SAME AS EDISON DECIMAL ===
+            if timeframe == "45m":
+                try:
+                    server_time = int(client.public_request("/fapi/v1/time")["serverTime"])
+                except:
+                    server_time = int(time.time() * 1000)
+                interval = interval_ms(timeframe)
+                next_close_ms = ((server_time // interval) * interval) + interval
+            else:
+                try:
+                    server_time = int(client.public_request("/fapi/v1/time")["serverTime"])
+                except:
+                    server_time = int(time.time() * 1000)
+                interval = interval_ms(timeframe)
+                next_close_ms = ((server_time // interval) * interval) + interval
+
+            now_ms = int(time.time() * 1000)
+            wait_sec = max(2.0, (next_close_ms - now_ms) / 1000.0 + 2.0)
+            next_dt_log = datetime.fromtimestamp(next_close_ms / 1000, tz=timezone.utc)
+            log(f"Waiting for next {timeframe} candle close in {wait_sec:.1f}s → {next_dt_log.strftime('%H:%M')} UTC",
+                telegram_bot, telegram_chat_id)
             _safe_sleep(wait_sec)
 
         except Exception as e:
             import traceback
-            log(f"Trading loop error: {str(e)}", telegram_bot, telegram_chat_id)
-            time.sleep(5)
+            log(f"Loop error: {str(e)}\n{traceback.format_exc()}", telegram_bot, telegram_chat_id)
+            time.sleep(2)
 
-    log("Trading loop exited cleanly.", telegram_bot, telegram_chat_id)
+    log("Trading loop exited.", telegram_bot, telegram_chat_id)
 
 def interval_ms(interval: str) -> int:
     interval = interval.strip().lower()
@@ -3197,7 +3210,7 @@ if __name__ == "__main__":
             bot_state.account_size = balance
             bot_state.daily_start_equity = balance
           
-            leverage_to_set = 5
+            leverage_to_set = 9
             bot_state.client.set_leverage(args.symbol, leverage_to_set)
             log(f"Set Binance leverage to {leverage_to_set}x for {args.symbol}", args.telegram_token, args.chat_id)
             
