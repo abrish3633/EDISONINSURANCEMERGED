@@ -33,7 +33,7 @@ import asyncio
 import telegram
 
 # ------------------- CONFIGURATION -------------------
-RISK_PCT = Decimal("0.068")  # 6.8% per trade (MAIN LEG)
+RISK_PCT = Decimal("0.0378")  # 6.8% per trade (MAIN LEG)
 SL_PCT = Decimal("0.0075")  # 0.75%
 TP_MULT = Decimal("9")       # MAIN LEG TP multiplier
 TRAIL_TRIGGER_MULT = Decimal("1.25")
@@ -105,8 +105,8 @@ NEWS_GUARD_ENABLED = True  # ← Will be overridden by --no-news-guard
 # CONFIG SLIPAGE
 MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'edison_insurance_bot.lock')
-BASE_RISK_PCT = Decimal("0.068")  # 6.8% when drawdown = 0%
-MAX_LEVERAGE = Decimal("9")        # MAIN LEG leverage
+BASE_RISK_PCT = Decimal("0.0378")  # 6.8% when drawdown = 0%
+MAX_LEVERAGE = Decimal("5")        # MAIN LEG leverage
 
 # === WEEKLY SCALING QUICK TOGGLE ===
 ENABLE_WEEKLY_SCALING = True  # ← Set to False to disable scaling completely
@@ -3210,7 +3210,7 @@ if __name__ == "__main__":
             bot_state.account_size = balance
             bot_state.daily_start_equity = balance
           
-            leverage_to_set = 9
+            leverage_to_set = 5
             bot_state.client.set_leverage(args.symbol, leverage_to_set)
             log(f"Set Binance leverage to {leverage_to_set}x for {args.symbol}", args.telegram_token, args.chat_id)
             
