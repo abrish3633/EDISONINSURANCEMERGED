@@ -163,6 +163,9 @@ class BotState:
         self.consec_loss_guard_alert_sent = False
         self.last_processed_close_ms: Optional[int] = None
         self.last_candle_state: Optional[str] = None
+        self.entry_candle_time: Optional[int] = None   # <<< ADD THIS
+        self.last_exit_candle_time: Optional[int] = None
+        
         self.last_no_klines_log = 0  # Added for trading_loop
         
         # Performance tracking
@@ -2146,7 +2149,10 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
                         bot=telegram_bot,
                         chat_id=telegram_chat_id
                     )
-                    
+                    # === DUMMY + EXTRA HARD EXIT MARKING ===
+                    bot_state.last_exit_candle_time = current_candle_close_time
+                    log(f"[{trade_state.leg_type}] 🚫 EXIT MARKED on candle {current_candle_close_time} → re-entry blocked until next candle", 
+                        telegram_bot, telegram_chat_id)
                     # === TARGETED CLEANUP — Only this leg's orders ===
                     try:
                         algo_open_resp = client.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
@@ -2327,6 +2333,8 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 continue
 
             bot_state.last_processed_close_ms = latest_close_ms
+            bot_state.entry_candle_time = None      # Reset on every new candle
+            bot_state.last_exit_candle_time = None  # Reset on every new candle
 
             # === HEARTBEAT (when flat) - Matches Decimal style ===
             try:
@@ -2371,323 +2379,331 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 log(f"Candle: {close_price:.4f} RSI={rsi_display} Vol={curr_vol:.0f} SMA15={vol_sma15_display} {'Green' if is_green_candle else 'Red'}", 
                     telegram_bot, telegram_chat_id)
                 bot_state.last_candle_state = state
-
-            # ==================== SIGNAL LOGIC ====================
-            buy_signal = (rsi and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and
-                         (not use_volume_filter or (vol_sma15 and curr_vol > vol_sma15)))
-            sell_signal = (rsi and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and not is_green_candle and
-                          (not use_volume_filter or (vol_sma15 and curr_vol > vol_sma15)))
-
-            if buy_signal or sell_signal:
-                original_side = "BUY" if buy_signal else "SELL"
-                insurance_side = "SELL" if buy_signal else "BUY"
-               
-                log(f"📊 SIGNAL DETECTED → MAIN: {original_side} | INSURANCE: {insurance_side}",
+                
+            # ===== EXTRA HARD SAME-CANDLE RE-ENTRY GUARD (DUMMY STYLE) =====
+            if (bot_state.entry_candle_time == latest_close_ms or 
+                bot_state.last_exit_candle_time == latest_close_ms):
+                log(f"🚫 SAME CANDLE BLOCKED → Entry or Exit already happened on this candle. Waiting for next.", 
                     telegram_bot, telegram_chat_id)
+                # Continue to perfect wait
+            else:
+                # ==================== SIGNAL LOGIC ====================
+                buy_signal = (rsi and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and
+                             (not use_volume_filter or (vol_sma15 and curr_vol > vol_sma15)))
+                sell_signal = (rsi and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and not is_green_candle and
+                              (not use_volume_filter or (vol_sma15 and curr_vol > vol_sma15)))
 
-                # SLIPPAGE CHECK
-                slippage_passed, _ = _check_slippage(client, symbol, close_price, telegram_bot, telegram_chat_id)
-                if not slippage_passed:
-                    continue
-
-                # === MAIN LEG ENTRY - DECIMAL CONSISTENT ===
-                original_side = "BUY" if buy_signal else "SELL"
-                insurance_side = "SELL" if buy_signal else "BUY"
-                
-                log(f"📊 SIGNAL DETECTED → MAIN: {original_side} | INSURANCE: {insurance_side}", 
-                    telegram_bot, telegram_chat_id)
-
-                # SLIPPAGE CHECK
-                slippage_passed, _ = _check_slippage(client, symbol, close_price, telegram_bot, telegram_chat_id)
-                if not slippage_passed:
-                    continue
-
-                # === MAIN LEG CALCULATIONS (All Decimal) ===
-                entry_price = close_price
-                R_main = entry_price * SL_PCT
-                actual_balance = fetch_balance(client)
-
-                main_virtual = actual_balance / Decimal("2")
-                main_margin = main_virtual * MARGIN_USAGE_PCT
-                main_risk = main_virtual * BASE_RISK_PCT
-
-                qty_raw = main_risk / R_main
-                max_by_margin = (main_margin * MAX_LEVERAGE) / entry_price
-                qty_main = min(qty_raw, max_by_margin, Decimal("25"))
-                qty_main = quantize_qty(qty_main, step_size)
-
-                if (qty_main * entry_price) < min_notional:
-                    log("Main leg quantity too small → skipping", telegram_bot, telegram_chat_id)
-                    continue
-
-                main_position_side = "LONG" if original_side == "BUY" else "SHORT"
-                
-                # Place MAIN order
-                order_res_main = client.send_signed_request("POST", "/fapi/v1/order", {
-                    "symbol": symbol, 
-                    "side": original_side, 
-                    "type": "MARKET",
-                    "quantity": str(qty_main), 
-                    "positionSide": main_position_side
-                })
-
-                # Wait for main fill
-                start_time = time.time()
-                actual_qty_main = None
-                while not bot_state.STOP_REQUESTED and (time.time() - start_time) < ORDER_FILL_TIMEOUT:
-                    pos_amt = get_position_amt_for_side(client, symbol, main_position_side)
-                    if pos_amt > Decimal('0.001'):
-                        actual_qty_main = pos_amt
-                        log(f"✅ Main fill detected! Qty: {actual_qty_main:.5f} SOL", telegram_bot, telegram_chat_id)
-                        break
-                    time.sleep(1)
-
-                if actual_qty_main is None:
-                    try:
-                        order_status = client.send_signed_request("GET", "/fapi/v1/order", {
-                            "symbol": symbol, 
-                            "orderId": order_res_main.get("orderId")
-                        })
-                        if order_status.get("status") == "FILLED":
-                            actual_qty_main = Decimal(str(order_status.get("executedQty", "0")))
-                            log(f"✅ Main fill detected via order status! Qty: {actual_qty_main:.5f} SOL", telegram_bot, telegram_chat_id)
-                    except Exception as e:
-                        log(f"Order status check failed: {e}", telegram_bot, telegram_chat_id)
-
-                if actual_qty_main is None or actual_qty_main <= Decimal('0'):
-                    log("❌ Main leg fill failed. Aborting trade.", telegram_bot, telegram_chat_id)
-                    continue
-
-                # Get actual fill price
-                actual_fill_price_dec = client.get_latest_fill_price(symbol, order_res_main.get("orderId")) or entry_price
-
-                # === CREATE MAIN TRADE STATE (All Decimal) ===
-                main_trade_state = TradeState()
-                main_trade_state.active = True
-                main_trade_state.leg_type = "MAIN"
-                main_trade_state.entry_price = actual_fill_price_dec
-                main_trade_state.qty = actual_qty_main
-                main_trade_state.side = "LONG" if original_side == "BUY" else "SHORT"
-                main_trade_state.entry_close_time = latest_close_ms
-                main_trade_state.risk = actual_fill_price_dec * SL_PCT
-                main_trade_state.trail_activated = False
-
-                # Calculate levels (All Decimal)
-                R_main = actual_fill_price_dec * SL_PCT
-                if main_trade_state.side == "LONG":
-                    sl_price_dec = actual_fill_price_dec * (Decimal("1") - SL_PCT)
-                    tp_price_dec = actual_fill_price_dec + (TP_MULT * R_main)
-                    trail_raw = actual_fill_price_dec + (TRAIL_TRIGGER_MULT * R_main)
-                    trail_buffered = trail_raw + TRAIL_PRICE_BUFFER
-                    trail_activation_quant = quantize_price(trail_buffered, tick_size, ROUND_UP)
-                else:
-                    sl_price_dec = actual_fill_price_dec * (Decimal("1") + SL_PCT)
-                    tp_price_dec = actual_fill_price_dec - (TP_MULT * R_main)
-                    trail_raw = actual_fill_price_dec - (TRAIL_TRIGGER_MULT * R_main)
-                    trail_buffered = trail_raw - TRAIL_PRICE_BUFFER
-                    trail_activation_quant = quantize_price(trail_buffered, tick_size, ROUND_DOWN)
-
-                main_trade_state.sl = quantize_price(sl_price_dec, tick_size, ROUND_DOWN if main_trade_state.side == "LONG" else ROUND_UP)
-                main_trade_state.tp = quantize_price(tp_price_dec, tick_size, ROUND_UP if main_trade_state.side == "LONG" else ROUND_DOWN)
-                main_trade_state.trail_activation_price = trail_activation_quant
-
-                # Telegram notification
-                tg_msg_main = f"📈 MAIN LEG ENTRY\n{symbol} {main_trade_state.side}\nEntry: {actual_fill_price_dec:.4f}\nQty: {actual_qty_main:.5f}\nSL: {main_trade_state.sl:.4f}\nTP: {main_trade_state.tp:.4f}"
-                telegram_post(telegram_bot, telegram_chat_id, tg_msg_main)
-
-                # Place protective orders
-                place_orders(client, symbol, main_trade_state, tick_size, telegram_bot, telegram_chat_id)
-                
-                # Store and start monitoring
-                bot_state.current_trade = main_trade_state
-                
-                threading.Thread(
-                    target=monitor_trade,
-                    args=(client, symbol, main_trade_state, tick_size, telegram_bot, telegram_chat_id, latest_close_ms),
-                    daemon=True
-                ).start()
-
-                log(f"✅ Main leg monitoring started", telegram_bot, telegram_chat_id)
-
-                                
-                                # === INSURANCE LEG - FULLY ROBUST VERSION ===
-                if INSURANCE_ENABLED:
-                    log(f"Waiting {INSURANCE_DELAY_MS}ms before insurance entry...", telegram_bot, telegram_chat_id)
-                    time.sleep(INSURANCE_DELAY_MS / 1000.0)
-                    
-                    ins_virtual_equity = actual_balance / Decimal("2")
-                    ins_margin_available = ins_virtual_equity * MARGIN_USAGE_PCT
-                    
-                    # Use SAME quantity as MAIN for perfect hedge
-                    qty_insurance = actual_qty_main
-                    max_qty_by_margin_ins = (ins_margin_available * MAX_LEVERAGE) / entry_price
-                    
-                    if qty_insurance > max_qty_by_margin_ins:
-                        log(f"⚠️ Insurance would exceed margin, reducing from {qty_insurance:.5f} to {max_qty_by_margin_ins:.5f}", 
-                            telegram_bot, telegram_chat_id)
-                        qty_insurance = max_qty_by_margin_ins
-                    
-                    qty_insurance = min(qty_insurance, Decimal("25"))
-                    qty_insurance = quantize_qty(qty_insurance, step_size)
-                    
-                    log(f"INSURANCE: Virtual=${ins_virtual_equity:.2f} | Target Qty={qty_insurance:.5f} SOL", 
+                if buy_signal or sell_signal:
+                    original_side = "BUY" if buy_signal else "SELL"
+                    insurance_side = "SELL" if buy_signal else "BUY"
+                   
+                    log(f"📊 SIGNAL DETECTED → MAIN: {original_side} | INSURANCE: {insurance_side}",
                         telegram_bot, telegram_chat_id)
+
+                    # SLIPPAGE CHECK
+                    slippage_passed, _ = _check_slippage(client, symbol, close_price, telegram_bot, telegram_chat_id)
+                    if not slippage_passed:
+                        continue
+
+                    # === MAIN LEG ENTRY - DECIMAL CONSISTENT ===
+                    original_side = "BUY" if buy_signal else "SELL"
+                    insurance_side = "SELL" if buy_signal else "BUY"
                     
-                    if (qty_insurance * entry_price) < min_notional:
-                        log("Insurance quantity too small → SKIPPING INSURANCE", telegram_bot, telegram_chat_id)
-                    else:
-                        insurance_side = "SELL" if original_side == "BUY" else "BUY"
-                        insurance_position_side = "SHORT" if original_side == "BUY" else "LONG"
-                        
-                        actual_qty_insurance = Decimal("0")
-                        actual_insurance_entry = actual_fill_price_dec  # fallback
-                        
-                        # === PLACE ORDER (with error tolerance) ===
+                    log(f"📊 SIGNAL DETECTED → MAIN: {original_side} | INSURANCE: {insurance_side}", 
+                        telegram_bot, telegram_chat_id)
+
+                    # SLIPPAGE CHECK
+                    slippage_passed, _ = _check_slippage(client, symbol, close_price, telegram_bot, telegram_chat_id)
+                    if not slippage_passed:
+                        continue
+
+                    # === MAIN LEG CALCULATIONS (All Decimal) ===
+                    entry_price = close_price
+                    R_main = entry_price * SL_PCT
+                    actual_balance = fetch_balance(client)
+
+                    main_virtual = actual_balance / Decimal("2")
+                    main_margin = main_virtual * MARGIN_USAGE_PCT
+                    main_risk = main_virtual * BASE_RISK_PCT
+
+                    qty_raw = main_risk / R_main
+                    max_by_margin = (main_margin * MAX_LEVERAGE) / entry_price
+                    qty_main = min(qty_raw, max_by_margin, Decimal("25"))
+                    qty_main = quantize_qty(qty_main, step_size)
+
+                    if (qty_main * entry_price) < min_notional:
+                        log("Main leg quantity too small → skipping", telegram_bot, telegram_chat_id)
+                        continue
+
+                    main_position_side = "LONG" if original_side == "BUY" else "SHORT"
+                    
+                    # Place MAIN order
+                    order_res_main = client.send_signed_request("POST", "/fapi/v1/order", {
+                        "symbol": symbol, 
+                        "side": original_side, 
+                        "type": "MARKET",
+                        "quantity": str(qty_main), 
+                        "positionSide": main_position_side
+                    })
+
+                    # Wait for main fill
+                    start_time = time.time()
+                    actual_qty_main = None
+                    while not bot_state.STOP_REQUESTED and (time.time() - start_time) < ORDER_FILL_TIMEOUT:
+                        pos_amt = get_position_amt_for_side(client, symbol, main_position_side)
+                        if pos_amt > Decimal('0.001'):
+                            actual_qty_main = pos_amt
+                            log(f"✅ Main fill detected! Qty: {actual_qty_main:.5f} SOL", telegram_bot, telegram_chat_id)
+                            break
+                        time.sleep(1)
+
+                    if actual_qty_main is None:
                         try:
-                            order_res_insurance = client.send_signed_request("POST", "/fapi/v1/order", {
-                                "symbol": symbol,
-                                "side": insurance_side,
-                                "type": "MARKET",
-                                "quantity": str(qty_insurance),
-                                "positionSide": insurance_position_side
+                            order_status = client.send_signed_request("GET", "/fapi/v1/order", {
+                                "symbol": symbol, 
+                                "orderId": order_res_main.get("orderId")
                             })
-                            log(f"Insurance order placed. OrderId: {order_res_insurance.get('orderId')}", 
-                                telegram_bot, telegram_chat_id)
+                            if order_status.get("status") == "FILLED":
+                                actual_qty_main = Decimal(str(order_status.get("executedQty", "0")))
+                                log(f"✅ Main fill detected via order status! Qty: {actual_qty_main:.5f} SOL", telegram_bot, telegram_chat_id)
                         except Exception as e:
-                            log(f"Insurance order error: {e} - will check if position exists anyway", 
+                            log(f"Order status check failed: {e}", telegram_bot, telegram_chat_id)
+
+                    if actual_qty_main is None or actual_qty_main <= Decimal('0'):
+                        log("❌ Main leg fill failed. Aborting trade.", telegram_bot, telegram_chat_id)
+                        continue
+
+                    # Get actual fill price
+                    actual_fill_price_dec = client.get_latest_fill_price(symbol, order_res_main.get("orderId")) or entry_price
+
+                    # === CREATE MAIN TRADE STATE (All Decimal) ===
+                    main_trade_state = TradeState()
+                    main_trade_state.active = True
+                    main_trade_state.leg_type = "MAIN"
+                    main_trade_state.entry_price = actual_fill_price_dec
+                    main_trade_state.qty = actual_qty_main
+                    main_trade_state.side = "LONG" if original_side == "BUY" else "SHORT"
+                    main_trade_state.entry_close_time = latest_close_ms
+                    main_trade_state.risk = actual_fill_price_dec * SL_PCT
+                    main_trade_state.trail_activated = False
+
+                    # Calculate levels (All Decimal)
+                    R_main = actual_fill_price_dec * SL_PCT
+                    if main_trade_state.side == "LONG":
+                        sl_price_dec = actual_fill_price_dec * (Decimal("1") - SL_PCT)
+                        tp_price_dec = actual_fill_price_dec + (TP_MULT * R_main)
+                        trail_raw = actual_fill_price_dec + (TRAIL_TRIGGER_MULT * R_main)
+                        trail_buffered = trail_raw + TRAIL_PRICE_BUFFER
+                        trail_activation_quant = quantize_price(trail_buffered, tick_size, ROUND_UP)
+                    else:
+                        sl_price_dec = actual_fill_price_dec * (Decimal("1") + SL_PCT)
+                        tp_price_dec = actual_fill_price_dec - (TP_MULT * R_main)
+                        trail_raw = actual_fill_price_dec - (TRAIL_TRIGGER_MULT * R_main)
+                        trail_buffered = trail_raw - TRAIL_PRICE_BUFFER
+                        trail_activation_quant = quantize_price(trail_buffered, tick_size, ROUND_DOWN)
+
+                    main_trade_state.sl = quantize_price(sl_price_dec, tick_size, ROUND_DOWN if main_trade_state.side == "LONG" else ROUND_UP)
+                    main_trade_state.tp = quantize_price(tp_price_dec, tick_size, ROUND_UP if main_trade_state.side == "LONG" else ROUND_DOWN)
+                    main_trade_state.trail_activation_price = trail_activation_quant
+
+                    # Telegram notification
+                    tg_msg_main = f"📈 MAIN LEG ENTRY\n{symbol} {main_trade_state.side}\nEntry: {actual_fill_price_dec:.4f}\nQty: {actual_qty_main:.5f}\nSL: {main_trade_state.sl:.4f}\nTP: {main_trade_state.tp:.4f}"
+                    telegram_post(telegram_bot, telegram_chat_id, tg_msg_main)
+
+                    # Place protective orders
+                    place_orders(client, symbol, main_trade_state, tick_size, telegram_bot, telegram_chat_id)
+                    
+                    # Store and start monitoring
+                    bot_state.current_trade = main_trade_state
+                    bot_state.entry_candle_time = latest_close_ms
+                    
+                    threading.Thread(
+                        target=monitor_trade,
+                        args=(client, symbol, main_trade_state, tick_size, telegram_bot, telegram_chat_id, latest_close_ms),
+                        daemon=True
+                    ).start()
+
+                    log(f"✅ Main leg monitoring started", telegram_bot, telegram_chat_id)
+
+                    # === INSURANCE LEG - FULLY ROBUST VERSION ===
+                    if INSURANCE_ENABLED:
+                        log(f"Waiting {INSURANCE_DELAY_MS}ms before insurance entry...", telegram_bot, telegram_chat_id)
+                        time.sleep(INSURANCE_DELAY_MS / 1000.0)
+                        
+                        ins_virtual_equity = actual_balance / Decimal("2")
+                        ins_margin_available = ins_virtual_equity * MARGIN_USAGE_PCT
+                        
+                        # Use SAME quantity as MAIN for perfect hedge
+                        qty_insurance = actual_qty_main
+                        max_qty_by_margin_ins = (ins_margin_available * MAX_LEVERAGE) / entry_price
+                        
+                        if qty_insurance > max_qty_by_margin_ins:
+                            log(f"⚠️ Insurance would exceed margin, reducing from {qty_insurance:.5f} to {max_qty_by_margin_ins:.5f}", 
                                 telegram_bot, telegram_chat_id)
+                            qty_insurance = max_qty_by_margin_ins
                         
-                        # === ROBUST FILL DETECTION (90 seconds) ===
-                        start_time_ins = time.time()
-                        max_wait = 90
-                        position_confirmed = False
+                        qty_insurance = min(qty_insurance, Decimal("25"))
+                        qty_insurance = quantize_qty(qty_insurance, step_size)
                         
-                        while not bot_state.STOP_REQUESTED and (time.time() - start_time_ins) < max_wait:
-                            pos_amt = get_position_amt_for_side(client, symbol, insurance_position_side)
-                            if pos_amt > Decimal('0.0005'):
-                                actual_qty_insurance = pos_amt
-                                position_confirmed = True
-                                log(f"✅ Insurance fill detected! Qty: {actual_qty_insurance:.5f} SOL", 
+                        log(f"INSURANCE: Virtual=${ins_virtual_equity:.2f} | Target Qty={qty_insurance:.5f} SOL", 
+                            telegram_bot, telegram_chat_id)
+                        
+                        if (qty_insurance * entry_price) < min_notional:
+                            log("Insurance quantity too small → SKIPPING INSURANCE", telegram_bot, telegram_chat_id)
+                        else:
+                            insurance_side = "SELL" if original_side == "BUY" else "BUY"
+                            insurance_position_side = "SHORT" if original_side == "BUY" else "LONG"
+                            
+                            actual_qty_insurance = Decimal("0")
+                            actual_insurance_entry = actual_fill_price_dec  # fallback
+                            
+                            # === PLACE ORDER (with error tolerance) ===
+                            try:
+                                order_res_insurance = client.send_signed_request("POST", "/fapi/v1/order", {
+                                    "symbol": symbol,
+                                    "side": insurance_side,
+                                    "type": "MARKET",
+                                    "quantity": str(qty_insurance),
+                                    "positionSide": insurance_position_side
+                                })
+                                log(f"Insurance order placed. OrderId: {order_res_insurance.get('orderId')}", 
                                     telegram_bot, telegram_chat_id)
+                            except Exception as e:
+                                log(f"Insurance order error: {e} - will check if position exists anyway", 
+                                    telegram_bot, telegram_chat_id)
+                            
+                            # === ROBUST FILL DETECTION (90 seconds) ===
+                            start_time_ins = time.time()
+                            max_wait = 90
+                            position_confirmed = False
+                            
+                            while not bot_state.STOP_REQUESTED and (time.time() - start_time_ins) < max_wait:
+                                pos_amt = get_position_amt_for_side(client, symbol, insurance_position_side)
+                                if pos_amt > Decimal('0.0005'):
+                                    actual_qty_insurance = pos_amt
+                                    position_confirmed = True
+                                    log(f"✅ Insurance fill detected! Qty: {actual_qty_insurance:.5f} SOL", 
+                                        telegram_bot, telegram_chat_id)
+                                    
+                                    # Get actual entry price from Binance
+                                    try:
+                                        positions = fetch_open_positions_details(client, symbol)
+                                        for pos in positions:
+                                            if pos.get("positionSide") == insurance_position_side:
+                                                actual_insurance_entry = Decimal(str(pos.get("entryPrice", "0")))
+                                                log(f"Insurance actual entry: {actual_insurance_entry:.4f}", 
+                                                    telegram_bot, telegram_chat_id)
+                                                break
+                                    except Exception as e:
+                                        log(f"Could not fetch insurance entry price: {e}", telegram_bot, telegram_chat_id)
+                                    break
                                 
-                                # Get actual entry price from Binance
-                                try:
-                                    positions = fetch_open_positions_details(client, symbol)
-                                    for pos in positions:
-                                        if pos.get("positionSide") == insurance_position_side:
-                                            actual_insurance_entry = Decimal(str(pos.get("entryPrice", "0")))
-                                            log(f"Insurance actual entry: {actual_insurance_entry:.4f}", 
+                                # Also check order status as backup
+                                if 'order_res_insurance' in locals() and order_res_insurance.get("orderId"):
+                                    try:
+                                        status = client.send_signed_request("GET", "/fapi/v1/order", {
+                                            "symbol": symbol,
+                                            "orderId": order_res_insurance.get("orderId")
+                                        })
+                                        if status.get("status") == "FILLED":
+                                            actual_qty_insurance = Decimal(str(status.get("executedQty", "0")))
+                                            position_confirmed = True
+                                            log(f"✅ Insurance confirmed via order status. Qty: {actual_qty_insurance:.5f}", 
                                                 telegram_bot, telegram_chat_id)
                                             break
-                                except Exception as e:
-                                    log(f"Could not fetch insurance entry price: {e}", telegram_bot, telegram_chat_id)
-                                break
-                            
-                            # Also check order status as backup
-                            if 'order_res_insurance' in locals() and order_res_insurance.get("orderId"):
-                                try:
-                                    status = client.send_signed_request("GET", "/fapi/v1/order", {
-                                        "symbol": symbol,
-                                        "orderId": order_res_insurance.get("orderId")
-                                    })
-                                    if status.get("status") == "FILLED":
-                                        actual_qty_insurance = Decimal(str(status.get("executedQty", "0")))
-                                        position_confirmed = True
-                                        log(f"✅ Insurance confirmed via order status. Qty: {actual_qty_insurance:.5f}", 
-                                            telegram_bot, telegram_chat_id)
-                                        break
-                                except:
-                                    pass
-                            
-                            time.sleep(1.5)
-                        
-                        # === FINAL CHECK: Did position appear? ===
-                        if not position_confirmed or actual_qty_insurance <= Decimal('0'):
-                            # Last chance: direct position check
-                            final_pos = get_position_amt_for_side(client, symbol, insurance_position_side)
-                            if final_pos > Decimal('0.0005'):
-                                actual_qty_insurance = final_pos
-                                position_confirmed = True
-                                log(f"✅ Insurance found via final check! Qty: {actual_qty_insurance:.5f}", 
-                                    telegram_bot, telegram_chat_id)
+                                    except:
+                                        pass
                                 
-                                # Get entry price
-                                try:
-                                    positions = fetch_open_positions_details(client, symbol)
-                                    for pos in positions:
-                                        if pos.get("positionSide") == insurance_position_side:
-                                            actual_insurance_entry = Decimal(str(pos.get("entryPrice", "0")))
-                                            break
-                                except:
-                                    pass
-                        
-                        # === IF POSITION EXISTS, CREATE TRADE STATE AND PLACE PROTECTION ===
-                        if position_confirmed and actual_qty_insurance > Decimal('0'):
-                            insurance_trade_state = TradeState()
-                            insurance_trade_state.active = True
-                            insurance_trade_state.leg_type = "INSURANCE"
-                            insurance_trade_state.side = "LONG" if insurance_side == "BUY" else "SHORT"
-                            insurance_trade_state.entry_price = actual_insurance_entry
-                            insurance_trade_state.qty = actual_qty_insurance
-                            insurance_trade_state.entry_close_time = latest_close_ms
-                            insurance_trade_state.risk = actual_insurance_entry * SL_PCT
-                            insurance_trade_state.trail_activated = False
+                                time.sleep(1.5)
                             
-                            # Calculate SL and TP based on MAIN direction
-                            R = actual_insurance_entry * SL_PCT
-                            if original_side == "BUY":  # MAIN LONG → insurance SHORT
-                                sl_price_dec = actual_insurance_entry + R
-                                tp_price_dec = actual_insurance_entry - (R * INSURANCE_TP_MULT)
-                                sl_rounding = ROUND_UP
-                                tp_rounding = ROUND_DOWN
-                            else:  # MAIN SHORT → insurance LONG
-                                sl_price_dec = actual_insurance_entry - R
-                                tp_price_dec = actual_insurance_entry + (R * INSURANCE_TP_MULT)
-                                sl_rounding = ROUND_DOWN
-                                tp_rounding = ROUND_UP
+                            # === FINAL CHECK: Did position appear? ===
+                            if not position_confirmed or actual_qty_insurance <= Decimal('0'):
+                                # Last chance: direct position check
+                                final_pos = get_position_amt_for_side(client, symbol, insurance_position_side)
+                                if final_pos > Decimal('0.0005'):
+                                    actual_qty_insurance = final_pos
+                                    position_confirmed = True
+                                    log(f"✅ Insurance found via final check! Qty: {actual_qty_insurance:.5f}", 
+                                        telegram_bot, telegram_chat_id)
+                                    
+                                    # Get entry price
+                                    try:
+                                        positions = fetch_open_positions_details(client, symbol)
+                                        for pos in positions:
+                                            if pos.get("positionSide") == insurance_position_side:
+                                                actual_insurance_entry = Decimal(str(pos.get("entryPrice", "0")))
+                                                break
+                                    except:
+                                        pass
                             
-                            insurance_trade_state.sl = quantize_price(sl_price_dec, tick_size, sl_rounding)
-                            insurance_trade_state.tp = quantize_price(tp_price_dec, tick_size, tp_rounding)
-                            insurance_trade_state.trail_activation_price = None
-                            
-                            # Telegram notification
-                            tg_msg_insurance = (
-                                f"🛡️ INSURANCE LEG ENTRY\n"
-                                f"━━━━━━━━━━━━━━━━\n"
-                                f"{insurance_trade_state.side} {symbol}\n"
-                                f"Entry: {actual_insurance_entry:.4f}\n"
-                                f"Qty: {actual_qty_insurance:.5f} SOL\n"
-                                f"SL: {insurance_trade_state.sl:.4f} (1R)\n"
-                                f"TP: {insurance_trade_state.tp:.4f} ({INSURANCE_TP_MULT}R)\n"
-                                f"Trailing: DISABLED"
-                            )
-                            telegram_post(telegram_bot, telegram_chat_id, tg_msg_insurance)
-                            
-                            # CRITICAL: Place protective orders
-                            place_orders(client, symbol, insurance_trade_state, tick_size, telegram_bot, telegram_chat_id)
-                            
-                            # Store and start monitoring
-                            bot_state.insurance_trade = insurance_trade_state
-                            bot_state.INSURANCE_ACTIVE = True
-                            
-                            threading.Thread(
-                                target=monitor_trade,
-                                args=(client, symbol, insurance_trade_state, tick_size, 
-                                      telegram_bot, telegram_chat_id, latest_close_ms),
-                                daemon=True
-                            ).start()
-                            log(f"✅ Insurance leg monitoring started", telegram_bot, telegram_chat_id)
-                            
-                        else:
-                            log("❌ Insurance leg failed to fill. Continuing with main leg only.", 
-                                telegram_bot, telegram_chat_id)
-                
-                trades_today += 1
-                pending_entry = False
+                            # === IF POSITION EXISTS, CREATE TRADE STATE AND PLACE PROTECTION ===
+                            if position_confirmed and actual_qty_insurance > Decimal('0'):
+                                insurance_trade_state = TradeState()
+                                insurance_trade_state.active = True
+                                insurance_trade_state.leg_type = "INSURANCE"
+                                insurance_trade_state.side = "LONG" if insurance_side == "BUY" else "SHORT"
+                                insurance_trade_state.entry_price = actual_insurance_entry
+                                insurance_trade_state.qty = actual_qty_insurance
+                                insurance_trade_state.entry_close_time = latest_close_ms
+                                insurance_trade_state.risk = actual_insurance_entry * SL_PCT
+                                insurance_trade_state.trail_activated = False
+                                
+                                # Calculate SL and TP based on MAIN direction
+                                R = actual_insurance_entry * SL_PCT
+                                if original_side == "BUY":  # MAIN LONG → insurance SHORT
+                                    sl_price_dec = actual_insurance_entry + R
+                                    tp_price_dec = actual_insurance_entry - (R * INSURANCE_TP_MULT)
+                                    sl_rounding = ROUND_UP
+                                    tp_rounding = ROUND_DOWN
+                                else:  # MAIN SHORT → insurance LONG
+                                    sl_price_dec = actual_insurance_entry - R
+                                    tp_price_dec = actual_insurance_entry + (R * INSURANCE_TP_MULT)
+                                    sl_rounding = ROUND_DOWN
+                                    tp_rounding = ROUND_UP
+                                
+                                insurance_trade_state.sl = quantize_price(sl_price_dec, tick_size, sl_rounding)
+                                insurance_trade_state.tp = quantize_price(tp_price_dec, tick_size, tp_rounding)
+                                insurance_trade_state.trail_activation_price = None
+                                
+                                # Telegram notification
+                                tg_msg_insurance = (
+                                    f"🛡️ INSURANCE LEG ENTRY\n"
+                                    f"━━━━━━━━━━━━━━━━\n"
+                                    f"{insurance_trade_state.side} {symbol}\n"
+                                    f"Entry: {actual_insurance_entry:.4f}\n"
+                                    f"Qty: {actual_qty_insurance:.5f} SOL\n"
+                                    f"SL: {insurance_trade_state.sl:.4f} (1R)\n"
+                                    f"TP: {insurance_trade_state.tp:.4f} ({INSURANCE_TP_MULT}R)\n"
+                                    f"Trailing: DISABLED"
+                                )
+                                telegram_post(telegram_bot, telegram_chat_id, tg_msg_insurance)
+                                
+                                # CRITICAL: Place protective orders
+                                place_orders(client, symbol, insurance_trade_state, tick_size, telegram_bot, telegram_chat_id)
+                                
+                                # Store and start monitoring
+                                bot_state.insurance_trade = insurance_trade_state
+                                bot_state.INSURANCE_ACTIVE = True
+                                bot_state.entry_candle_time = latest_close_ms
+                                
+                                threading.Thread(
+                                    target=monitor_trade,
+                                    args=(client, symbol, insurance_trade_state, tick_size, 
+                                          telegram_bot, telegram_chat_id, latest_close_ms),
+                                    daemon=True
+                                ).start()
+                                log(f"✅ Insurance leg monitoring started", telegram_bot, telegram_chat_id)
+                                
+                            else:
+                                log("❌ Insurance leg failed to fill. Continuing with main leg only.", 
+                                    telegram_bot, telegram_chat_id)
+                    
+                    trades_today += 1
+                    pending_entry = False
 
-            else:
-                if not pending_entry:
-                    log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
+                else:
+                    if not pending_entry:
+                        log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
 
             # === PERFECT 45m WAIT — EXACT SAME AS EDISON DECIMAL ===
             if timeframe == "45m":
@@ -2754,7 +2770,7 @@ def _safe_sleep(total_seconds: float):
 import pickle
 
 # ------------------- PERSISTENT STATE MANAGEMENT -------------------
-STATE_FILE = 'bot_state.pkl'
+STATE_FILE = 'bot_state_hedge.pkl'
 
 def save_bot_state():
     """Save critical bot state to disk"""
